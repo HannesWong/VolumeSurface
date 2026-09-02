@@ -1,0 +1,30 @@
+material {
+    name : SurfaceTargetDebug,
+    requires : [
+        color
+    ],
+    shadingModel : lit,
+    blending : transparent,
+    culling : back,
+    depthWrite : false,
+    depthCulling : true,
+    parameters : [
+        {
+            type : bool,
+            name : NORMAL_CULL
+        }
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        vec3 normal = normalize(getWorldNormalVector());
+        vec3 viewDirection = normalize(getWorldViewVector());
+        if (materialParams.NORMAL_CULL && dot(normal, viewDirection) <= 0.0) {
+            material.baseColor = vec4(0.0);
+            return;
+        }
+        material.baseColor = getColor();
+    }
+}

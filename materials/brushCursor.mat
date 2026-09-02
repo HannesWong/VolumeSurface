@@ -1,0 +1,18 @@
+material {
+    name : BrushCursor,
+    requires : [
+        color
+    ],
+    shadingModel : unlit,
+    blending : transparent,
+    culling : none,
+    depthWrite : false,
+    depthCulling : false
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor = getColor();
+    }
+}
