@@ -1,4 +1,6 @@
 #include "volume_surface/SurfaceTarget.h"
+#include "volume_surface/SurfaceNormalField.h"
+#include "volume_surface/VdbSurfaceProbe.h"
 
 #include <openvdb/openvdb.h>
 
@@ -169,6 +171,98 @@ void testCacheSaveLoadRoundTrip()
     std::filesystem::remove(path, errorCode);
 }
 
+void testConnectedNormalTrend()
+{
+    const auto grid = createLayeredFog();
+    volume_surface::SurfaceTargetSettings targetSettings;
+    targetSettings.isoValue = 255.0;
+    targetSettings.transitionLayers = 2;
+    targetSettings.normalRadius = 2.0;
+    targetSettings.planarityRadius = 1.0;
+    const auto cache = volume_surface::extractSurfaceTarget(*grid, targetSettings);
+
+    volume_surface::SurfaceNormalSmoothingSettings normalSettings;
+    normalSettings.strength = 1.0;
+    normalSettings.robustIterations = 2;
+    normalSettings.neighborhood = volume_surface::SurfaceNormalNeighborhood::Grid3x3;
+    const auto small = volume_surface::smoothSurfaceTargetNormals(
+        cache,
+        normalSettings);
+    require(small.normals.size() == cache.samples.size(),
+        "3x3 normal trend changed sample cardinality");
+    require(small.smoothedCoreCount > 0,
+        "3x3 normal trend produced no core normals");
+
+    normalSettings.neighborhood = volume_surface::SurfaceNormalNeighborhood::Grid5x5;
+    const auto large = volume_surface::smoothSurfaceTargetNormals(
+        cache,
+        normalSettings);
+    require(large.normals.size() == cache.samples.size(),
+        "5x5 normal trend changed sample cardinality");
+    require(large.smoothedCoreCount > 0,
+        "5x5 normal trend produced no core normals");
+    const auto* core = findSample(cache, openvdb::Coord(0, 0, 0));
+    require(core != nullptr, "normal trend test core sample is missing");
+    std::size_t coreIndex = 0;
+    while (coreIndex < cache.samples.size() && &cache.samples[coreIndex] != core) {
+        ++coreIndex;
+    }
+    require(coreIndex < cache.samples.size(), "normal trend core index is invalid");
+    require(openvdb::Vec3d(small.normals[coreIndex]).dot(
+                openvdb::Vec3d(core->normal)) > 0.0,
+        "3x3 normal trend reversed the seed orientation");
+    require(openvdb::Vec3d(large.normals[coreIndex]).dot(
+                openvdb::Vec3d(core->normal)) > 0.0,
+        "5x5 normal trend reversed the seed orientation");
+
+    volume_surface::SurfaceNormalFitSettings fitSettings;
+    fitSettings.neighborhood = volume_surface::SurfaceFitNeighborhood::Grid9x9;
+    const auto fitted = volume_surface::fitSurfaceTargetNormals(
+        cache,
+        fitSettings);
+    require(fitted.normals.size() == cache.samples.size() &&
+            fitted.smoothedCoreCount > 0,
+        "9x9 surface fit produced no fitted core normals");
+    require(openvdb::Vec3d(fitted.normals[coreIndex]).dot(
+                openvdb::Vec3d(core->normal)) > 0.0,
+        "9x9 surface fit reversed the seed orientation");
+    const auto gridOriented = volume_surface::fitSurfaceTargetNormals(
+        *grid,
+        cache,
+        fitSettings);
+    require(openvdb::Vec3d(gridOriented.normals[coreIndex]).dot(
+                openvdb::Vec3d(core->normal)) > 0.0,
+        "grid-oriented 9x9 surface fit reversed the surface direction");
+    normalSettings.neighborhood = volume_surface::SurfaceNormalNeighborhood::None;
+    const auto unsmoothed = volume_surface::smoothSurfaceTargetNormals(
+        cache,
+        fitted,
+        normalSettings);
+    require(unsmoothed.normals.size() == fitted.normals.size() &&
+            unsmoothed.smoothedCoreCount == 0 &&
+            (openvdb::Vec3d(unsmoothed.normals[coreIndex]) -
+                openvdb::Vec3d(fitted.normals[coreIndex])).lengthSqr() < 1.0e-12,
+        "None normal trend changed the fitted seed field");
+}
+
+void testVdbSurfaceProbe()
+{
+    const auto grid = createLayeredFog();
+    volume_surface::VdbSurfaceProbeSettings settings;
+    settings.isoValue = 255.0;
+    settings.valueTolerance = 0.5;
+    const auto result = volume_surface::projectVdbSurface(
+        *grid,
+        grid->indexToWorld(openvdb::Vec3d(0.5, 0.0, 0.0)),
+        settings);
+    require(result.valid && result.converged,
+        "VDB surface probe did not converge on a layered fog boundary");
+    require(std::abs(result.indexPosition.x()) < 0.01,
+        "VDB surface probe converged to the wrong index position");
+    require(result.nearestVoxel == openvdb::Coord(0, 0, 0),
+        "VDB surface probe returned the wrong nearest voxel");
+}
+
 } // namespace
 
 int main()
@@ -177,6 +271,8 @@ int main()
         openvdb::initialize();
         testCoreAndTransitionSamples();
         testCacheSaveLoadRoundTrip();
+        testConnectedNormalTrend();
+        testVdbSurfaceProbe();
         std::cout << "surface_target_tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

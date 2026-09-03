@@ -105,7 +105,8 @@ bool intersectTriangle(
     const openvdb::Vec3d& origin,
     const openvdb::Vec3d& direction,
     double maximumDistance,
-    double& distance) noexcept
+    double& distance,
+    std::array<double, 3>& barycentric) noexcept
 {
     const std::size_t indexOffset = static_cast<std::size_t>(triangle) * 3;
     if (indexOffset + 2 >= indices.size()) {
@@ -152,6 +153,7 @@ bool intersectTriangle(
         return false;
     }
     distance = candidateDistance;
+    barycentric = {1.0 - u - v, u, v};
     return true;
 }
 
@@ -209,7 +211,9 @@ public:
     [[nodiscard]] bool intersect(
         const CameraPickRay& ray,
         double maximumDistance,
-        double& distance) const noexcept
+        double& distance,
+        std::size_t& triangleIndex,
+        std::array<double, 3>& barycentric) const noexcept
     {
         if (mNodes.empty()) {
             return false;
@@ -232,6 +236,7 @@ public:
             if (node.leaf) {
                 for (std::uint32_t offset = 0; offset < node.count; ++offset) {
                     double candidateDistance = nearestDistance;
+                    std::array<double, 3> candidateBarycentric{};
                     if (intersectTriangle(
                             mVertices,
                             mIndices,
@@ -239,8 +244,11 @@ public:
                             ray.origin,
                             ray.direction,
                             nearestDistance,
-                            candidateDistance)) {
+                            candidateDistance,
+                            candidateBarycentric)) {
                         nearestDistance = candidateDistance;
+                        triangleIndex = mTriangles[node.first + offset].triangle;
+                        barycentric = candidateBarycentric;
                         hit = true;
                     }
                 }
@@ -370,6 +378,8 @@ CameraPickHit CameraPickController::pick(
     CameraPickRay normalizedRay = ray;
     normalizedRay.direction /= directionLength;
     double nearestDistance = std::numeric_limits<double>::infinity();
+    std::size_t nearestTriangle = 0;
+    std::array<double, 3> nearestBarycentric{};
     for (std::size_t slotIndex = 0; slotIndex < kSlotCount; ++slotIndex) {
         if (!visibleSlots[slotIndex] || !mImpl->slots[slotIndex] ||
             mImpl->slots[slotIndex]->empty()) {
@@ -379,13 +389,17 @@ CameraPickHit CameraPickController::pick(
         if (!mImpl->slots[slotIndex]->intersect(
                 normalizedRay,
                 nearestDistance,
-                candidateDistance)) {
+                candidateDistance,
+                nearestTriangle,
+                nearestBarycentric)) {
             continue;
         }
         if (candidateDistance < nearestDistance) {
             nearestDistance = candidateDistance;
             result.hit = true;
             result.slotIndex = slotIndex;
+            result.triangleIndex = nearestTriangle;
+            result.barycentric = nearestBarycentric;
             result.rayDistance = candidateDistance;
             result.scenePosition = normalizedRay.origin +
                 normalizedRay.direction * candidateDistance;

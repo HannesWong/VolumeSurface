@@ -17,6 +17,7 @@
 #include "volume_surface/SurfaceNormalField.h"
 #include "volume_surface/SurfaceTarget.h"
 #include "volume_surface/SurfaceTargetPreview.h"
+#include "volume_surface/viewer/SurfaceAwareCameraController.h"
 #include "volume_surface/viewer/BrushCursorRenderer.h"
 #include "volume_surface/viewer/BrushHeatmapRenderer.h"
 #include "volume_surface/viewer/BrushInteractionController.h"
@@ -28,7 +29,9 @@
 #include "volume_surface/viewer/MeshRenderer.h"
 #include "volume_surface/viewer/PresentationController.h"
 #include "volume_surface/viewer/ReconstructionPanel.h"
+#include "volume_surface/viewer/ReconstructionPick.h"
 #include "volume_surface/viewer/SliceRenderer.h"
+#include "volume_surface/viewer/SurfaceFitPlaneRenderer.h"
 #include "volume_surface/viewer/ViewerContext.h"
 #include "volume_surface/viewer/WorkflowController.h"
 #include "volume_surface/viewer/WorkflowPanel.h"
@@ -49,9 +52,15 @@ struct ViewerState : DocumentSession, BrushInteractionState {
         MeshSlot{"Result C", {}, {0.50f, 0.90f, 0.50f}, 0.65f, false}};
     MeshRenderer meshRenderer;
     CameraPickController cameraPickController;
+    SurfaceAwareCameraController surfaceAwareCameraController;
     PresentationController presentationController;
     filament::math::float3 referenceCenter{};
     float displayScale = 1.0f;
+    volume_surface::SurfaceNormalFitSettings normalFitSettings;
+    volume_surface::SurfaceNormalField normalFitField;
+    bool normalFitReady = false;
+    bool normalFitPreviewActive = false;
+    std::string normalFitStatus = "Fitted normal seeds have not been built";
     volume_surface::SurfaceNormalSmoothingSettings normalSmoothingSettings;
     volume_surface::SurfaceNormalField normalField;
     bool normalFieldReady = false;
@@ -86,9 +95,16 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     std::size_t brushStrokeCount = 0;
     volume_surface::SurfaceBrushResult brushResult;
     volume_surface::SurfaceTargetPreview surfaceTargetPreview;
+    SurfaceFitPlaneRenderer surfaceFitPlaneRenderer;
     std::string surfaceTargetStatus = "Surface target pending";
     std::string surfaceTargetCacheStatus = "No saved surface target cache";
     std::string reconstructionStatus = "Result A has not been generated";
+    bool reconstructionPickArmed = false;
+    bool reconstructionPickRequested = false;
+    int reconstructionPickX = 0;
+    int reconstructionPickY = 0;
+    ReconstructionPickReport reconstructionPickReport;
+    std::string reconstructionPickStatus = "No reconstruction point has been picked";
     std::string brushWeightFieldStatus = "No weight field has been saved";
     BrushHeatmapRenderer brushHeatmap;
     BrushCursorRenderer brushCursorRenderer;

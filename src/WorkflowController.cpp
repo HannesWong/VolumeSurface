@@ -16,12 +16,12 @@ const char* workflowStageName(WorkflowStage stage) noexcept
     switch (stage) {
         case WorkflowStage::Source:
             return "Source VDB";
-        case WorkflowStage::Validation:
-            return "Surface Validation";
         case WorkflowStage::SurfaceTarget:
             return "Surface Target";
+        case WorkflowStage::SurfaceFit:
+            return "Surface Fit / Normal Seed";
         case WorkflowStage::NormalField:
-            return "Normal Field";
+            return "Surface Normal";
         case WorkflowStage::WeightPainting:
             return "Weight Painting";
         case WorkflowStage::Reconstruction:

@@ -21,6 +21,8 @@ struct CameraPickHit
 {
     bool hit = false;
     std::size_t slotIndex = 0;
+    std::size_t triangleIndex = 0;
+    std::array<double, 3> barycentric{};
     double rayDistance = 0.0;
     openvdb::Vec3d scenePosition{};
 };

@@ -69,6 +69,7 @@ using ViewerOptions = volume_surface::viewer::ViewerOptions;
 using CameraPickHit = volume_surface::viewer::CameraPickHit;
 using CameraPickRay = volume_surface::viewer::CameraPickRay;
 using WorkflowPanel = volume_surface::viewer::WorkflowPanel;
+using SurfaceFitPlaneRenderer = volume_surface::viewer::SurfaceFitPlaneRenderer;
 using ReconstructionPanelAction =
     volume_surface::viewer::ReconstructionPanelAction;
 using volume_surface::viewer::parseViewerOptions;
@@ -87,8 +88,72 @@ bool rebuildSurfaceTargetCache(
     bool tryLoadExisting = true);
 bool saveSurfaceTargetCacheToDisk(ViewerState& state);
 bool loadSurfaceTargetCacheFromDisk(ViewerState& state);
+bool rebuildSurfaceNormalFit(ViewerState& state);
 bool rebuildSurfaceNormalField(ViewerState& state);
 bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& scene);
+void processSurfaceFitPick(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene,
+    const View& view);
+void rebuildPickedSurfaceFitPlane(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene);
+
+bool hasUsableNormalField(const ViewerState& state)
+{
+    return state.normalFieldReady &&
+        state.surfaceTargetCache &&
+        state.normalField.normals.size() == state.surfaceTargetCache->samples.size();
+}
+
+const char* normalFitNeighborhoodName(const ViewerState& state)
+{
+    switch (state.normalFitSettings.neighborhood) {
+        case volume_surface::SurfaceFitNeighborhood::Grid5x5:
+            return "5x5";
+        case volume_surface::SurfaceFitNeighborhood::Grid9x9:
+            return "9x9";
+        case volume_surface::SurfaceFitNeighborhood::Grid3x3:
+            return "3x3";
+    }
+    return "3x3";
+}
+
+std::size_t normalFitNeighborhoodSide(const ViewerState& state)
+{
+    switch (state.normalFitSettings.neighborhood) {
+        case volume_surface::SurfaceFitNeighborhood::Grid5x5:
+            return 5;
+        case volume_surface::SurfaceFitNeighborhood::Grid9x9:
+            return 9;
+        case volume_surface::SurfaceFitNeighborhood::Grid3x3:
+            return 3;
+    }
+    return 3;
+}
+
+const char* normalTrendNeighborhoodName(const ViewerState& state)
+{
+    switch (state.normalSmoothingSettings.neighborhood) {
+        case volume_surface::SurfaceNormalNeighborhood::None:
+            return "none";
+        case volume_surface::SurfaceNormalNeighborhood::Grid5x5:
+            return "5x5";
+        case volume_surface::SurfaceNormalNeighborhood::Grid3x3:
+            return "3x3";
+    }
+    return "none";
+}
+
+std::string reconstructionNormalSourceName(const ViewerState& state)
+{
+    return hasUsableNormalField(state)
+        ? std::string("surface_fit_") + normalFitNeighborhoodName(state) +
+            "+surface_normal_" + normalTrendNeighborhoodName(state)
+        : std::string("surface_target_seed");
+}
 
 bool buildCameraPickRay(
     const View& view,
@@ -183,16 +248,47 @@ public:
                         mState->brushStrokeSampleRequested = true;
                     }
                 }
+                if (mSurfaceCameraGrabActive && !mState->brushControlDown) {
+                    updateSurfaceCameraDrag(event.mouseMove.x, event.mouseMove.y);
+                    event.type = filament::app::AppEvent::Type::TEXTINPUT;
+                    event.text.text[0] = '\0';
+                    continue;
+                }
             } else if (event.type == filament::app::AppEvent::Type::MOUSE_BUTTON_DOWN) {
                 mState->brushPointerX = event.mouseButton.x;
                 mState->brushPointerY = event.mouseButton.y;
                 const bool pointerOverUi = isPointerOverUi(
                     event.mouseButton.x,
                     event.mouseButton.y);
+                if (mState->reconstructionPickArmed &&
+                    mState->workflowController.stage() == WorkflowStage::SurfaceFit &&
+                    !mState->brushControlDown &&
+                    !pointerOverUi &&
+                    event.mouseButton.button == 1) {
+                    mState->reconstructionPickRequested = true;
+                    mState->reconstructionPickX = event.mouseButton.x;
+                    mState->reconstructionPickY = event.mouseButton.y;
+                    mState->reconstructionPickArmed = false;
+                    mCameraGrabActive = false;
+                    event.type = filament::app::AppEvent::Type::TEXTINPUT;
+                    event.text.text[0] = '\0';
+                    continue;
+                }
                 if (!mState->brushControlDown &&
                     !pointerOverUi &&
                     (event.mouseButton.button == 1 ||
                         event.mouseButton.button == 3)) {
+                    mSurfaceCameraGrabActive = beginSurfaceCameraDrag(
+                        event.mouseButton.button,
+                        event.mouseButton.x,
+                        event.mouseButton.y);
+                    mCameraGrabActive = mSurfaceCameraGrabActive;
+                    if (mSurfaceCameraGrabActive) {
+                        ImGui::GetIO().WantCaptureMouse = false;
+                        event.type = filament::app::AppEvent::Type::TEXTINPUT;
+                        event.text.text[0] = '\0';
+                        continue;
+                    }
                     mCameraGrabActive = true;
                     ImGui::GetIO().WantCaptureMouse = false;
                 }
@@ -211,6 +307,16 @@ public:
                     mState->brushPointerDirty = true;
                 }
             } else if (event.type == filament::app::AppEvent::Type::MOUSE_BUTTON_UP) {
+                if (mSurfaceCameraGrabActive &&
+                    (event.mouseButton.button == 1 ||
+                        event.mouseButton.button == 3)) {
+                    mState->surfaceAwareCameraController.endDrag();
+                    mSurfaceCameraGrabActive = false;
+                    mCameraGrabActive = false;
+                    event.type = filament::app::AppEvent::Type::TEXTINPUT;
+                    event.text.text[0] = '\0';
+                    continue;
+                }
                 if (event.mouseButton.button == 1 || event.mouseButton.button == 3) {
                     mCameraGrabActive = false;
                 }
@@ -228,6 +334,13 @@ public:
                 SDLDisplayManager::getMouseState(&pointerX, &pointerY);
                 mState->brushPointerX = pointerX;
                 mState->brushPointerY = pointerY;
+                if (!mState->brushControlDown &&
+                    !mState->brushParameterAdjustActive &&
+                    applySurfaceCameraWheel(event.mouseWheel.delta)) {
+                    event.type = filament::app::AppEvent::Type::TEXTINPUT;
+                    event.text.text[0] = '\0';
+                    continue;
+                }
             }
             if (event.type == filament::app::AppEvent::Type::KEYDOWN &&
                 (event.key.code == filament::app::AppKey::LEFT_CTRL ||
@@ -241,6 +354,11 @@ public:
                 }
                 mState->brushControlDown = mLeftControlDown || mRightControlDown;
                 if (!wasThisControlDown) {
+                    if (mState->brushControlDown && mSurfaceCameraGrabActive) {
+                        mState->surfaceAwareCameraController.cancelDrag();
+                        mSurfaceCameraGrabActive = false;
+                        mCameraGrabActive = false;
+                    }
                     mState->brushPointerDirty = true;
                     mState->brushCursorVisible = false;
                 }
@@ -298,6 +416,83 @@ public:
     }
 
 private:
+    bool pickAtPointer(
+        int pointerX,
+        int pointerY,
+        CameraPickRay& ray,
+        CameraPickHit& hit) const
+    {
+        if (!mState->context.view ||
+            !buildCameraPickRay(*mState->context.view, pointerX, pointerY, ray)) {
+            return false;
+        }
+        std::array<bool, 4> visibleSlots{};
+        for (std::size_t index = 0; index < visibleSlots.size(); ++index) {
+            visibleSlots[index] = mState->slots[index].visible;
+        }
+        hit = mState->cameraPickController.pick(ray, visibleSlots);
+        return true;
+    }
+
+    bool beginSurfaceCameraDrag(int button, int pointerX, int pointerY)
+    {
+        CameraPickRay ray;
+        CameraPickHit hit;
+        if (!pickAtPointer(pointerX, pointerY, ray, hit)) {
+            return false;
+        }
+        return mState->surfaceAwareCameraController.beginDrag(
+            button,
+            pointerX,
+            pointerY,
+            hit);
+    }
+
+    bool updateSurfaceCameraDrag(int pointerX, int pointerY)
+    {
+        CameraPickRay ray;
+        if (!mState->context.view ||
+            !buildCameraPickRay(*mState->context.view, pointerX, pointerY, ray)) {
+            return true;
+        }
+        mState->surfaceAwareCameraController.updateDrag(pointerX, pointerY, ray);
+        return true;
+    }
+
+    bool applySurfaceCameraWheel(std::int32_t rawDelta)
+    {
+        if (rawDelta == 0 || !mState->context.view ||
+            isPointerOverUi(mState->brushPointerX, mState->brushPointerY)) {
+            return false;
+        }
+        CameraPickRay ray;
+        CameraPickHit hit;
+        if (!pickAtPointer(
+                mState->brushPointerX,
+                mState->brushPointerY,
+                ray,
+                hit)) {
+            hit = {};
+        }
+        const auto result = mState->surfaceAwareCameraController.applyWheel(
+            rawDelta,
+            hit,
+            mState->displayScale,
+            mState->wheelZoomMultiplier,
+            mState->wheelHitDistanceRatio,
+            mState->wheelMinimumDistanceMillimeters,
+            mState->wheelSurfaceClearanceMillimeters);
+        if (!result.handled) {
+            return false;
+        }
+        mState->cameraWheelHit = result.hit;
+        mState->cameraWheelProjectedDistanceMillimeters =
+            result.projectedDistanceMillimeters;
+        mState->cameraWheelAppliedStepMillimeters = result.appliedStepMillimeters;
+        mState->cameraWheelUsedAdaptiveStep = result.usedAdaptiveStep;
+        return true;
+    }
+
     std::int32_t adaptWheelDelta(
         std::int32_t rawDelta,
         double& pendingWheelDistance)
@@ -461,6 +656,7 @@ private:
     bool mLeftControlDown = false;
     bool mRightControlDown = false;
     bool mCameraGrabActive = false;
+    bool mSurfaceCameraGrabActive = false;
 };
 
 
@@ -765,11 +961,17 @@ void applyWorkflowPresentation(ViewerState& state, Scene& scene)
     PresentationController::State presentationState;
     presentationState.surfaceTargetStage =
         state.workflowController.stage() == WorkflowStage::SurfaceTarget ||
+        state.workflowController.stage() == WorkflowStage::SurfaceFit ||
         state.workflowController.stage() == WorkflowStage::NormalField;
     presentationState.weightPaintingStage = showHeatmap;
     presentationState.showResults =
         state.workflowController.stage() == WorkflowStage::Reconstruction ||
         state.workflowController.stage() == WorkflowStage::Review;
+    presentationState.surfaceFitStage =
+        state.workflowController.stage() == WorkflowStage::SurfaceFit;
+    presentationState.surfaceFitPlaneAvailable =
+        state.reconstructionPickReport.hit;
+    presentationState.showSurfaceFitMesh = state.showSurfaceTargetMesh;
     presentationState.showReferenceMesh = state.showReferenceMesh;
     presentationState.showSurfaceTargetMesh = state.showSurfaceTargetMesh;
     state.presentationController.apply(
@@ -777,6 +979,7 @@ void applyWorkflowPresentation(ViewerState& state, Scene& scene)
         state.meshRenderer,
         state.slots,
         state.surfaceTargetPreview,
+        state.surfaceFitPlaneRenderer,
         state.brushHeatmap,
         presentationState);
     if (!showHeatmap) {
@@ -790,7 +993,12 @@ void setWorkflowStage(ViewerState& state, Scene& scene, WorkflowStage stage)
         applyWorkflowPresentation(state, scene);
         return;
     }
+    if (stage != WorkflowStage::SurfaceFit) {
+        state.reconstructionPickArmed = false;
+        state.reconstructionPickRequested = false;
+    }
     state.normalFieldPreviewActive = stage == WorkflowStage::NormalField;
+    state.normalFitPreviewActive = stage == WorkflowStage::SurfaceFit;
     state.normalFieldPreviewDirty = true;
     applyWorkflowPresentation(state, scene);
     state.status = std::string("Active stage: ") + workflowStageName(stage);
@@ -952,10 +1160,17 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
             std::chrono::steady_clock::now() - start).count();
     state.surfaceTargetCache = std::make_shared<volume_surface::SurfaceTargetCache>(
         std::move(loaded));
+    state.normalFitReady = false;
+    state.normalFitField = {};
+    state.normalFitStatus = "Fitted normal seeds have not been built for this cache";
     state.normalFieldReady = false;
     state.normalField = {};
     state.normalFieldStatus = "Normal field has not been built for this cache";
     state.normalFieldPreviewDirty = true;
+    state.reconstructionPickArmed = false;
+    state.reconstructionPickRequested = false;
+    state.reconstructionPickReport = {};
+    state.reconstructionPickStatus = "No reconstruction point has been picked";
     state.surfaceTargetCacheStatus =
         "Loaded " + state.surfaceTargetCachePath.filename().string();
     state.surfaceTargetStatus =
@@ -979,9 +1194,6 @@ bool rebuildSurfaceTargetCache(
 
     state.surfaceTargetSettings.isoValue = state.isoValue;
     constexpr double millimetersToMeters = 0.001;
-    state.surfaceTargetSettings.normalRadius =
-        std::max(0.0001, static_cast<double>(state.brushPlanarityRadiusMillimeters) *
-            millimetersToMeters);
     state.surfaceTargetSettings.planarityRadius =
         std::max(0.0001, static_cast<double>(state.brushPlanarityRadiusMillimeters) *
             millimetersToMeters);
@@ -1002,10 +1214,17 @@ bool rebuildSurfaceTargetCache(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
         state.surfaceTargetCache = std::move(cache);
+        state.normalFitReady = false;
+        state.normalFitField = {};
+        state.normalFitStatus = "Fitted normal seeds have not been built for this cache";
         state.normalFieldReady = false;
         state.normalField = {};
         state.normalFieldStatus = "Normal field has not been built for this cache";
         state.normalFieldPreviewDirty = true;
+        state.reconstructionPickArmed = false;
+        state.reconstructionPickRequested = false;
+        state.reconstructionPickReport = {};
+        state.reconstructionPickStatus = "No reconstruction point has been picked";
         state.surfaceTargetStatus =
             "Surface target ready: " +
             std::to_string(state.surfaceTargetCache->coreCount) +
@@ -1020,12 +1239,65 @@ bool rebuildSurfaceTargetCache(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
         state.surfaceTargetCache.reset();
+        state.normalFitReady = false;
+        state.normalFitField = {};
+        state.normalFitStatus = "Fitted normal seeds are unavailable";
         state.normalFieldReady = false;
         state.normalField = {};
         state.normalFieldStatus = "Normal field is unavailable";
         state.normalFieldPreviewDirty = true;
+        state.reconstructionPickArmed = false;
+        state.reconstructionPickRequested = false;
+        state.reconstructionPickReport = {};
+        state.reconstructionPickStatus = "No reconstruction point has been picked";
         state.surfaceTargetStatus = std::string("Surface target failed: ") + error.what();
         state.sliceDirty = true;
+        return false;
+    }
+}
+
+bool rebuildSurfaceNormalFit(ViewerState& state)
+{
+    if (!state.grid || !state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
+        state.normalFitReady = false;
+        state.normalFitField = {};
+        state.normalFitStatus = "Surface fit requires the source grid and SurfaceTarget cache";
+        return false;
+    }
+
+    try {
+        const auto start = std::chrono::steady_clock::now();
+        auto fitSettings = state.normalFitSettings;
+        fitSettings.isoValue = state.surfaceTargetSettings.isoValue;
+        state.normalFitField = volume_surface::fitSurfaceTargetNormals(
+            *state.grid,
+            *state.surfaceTargetCache,
+            fitSettings);
+        state.normalFitReady = !state.normalFitField.empty();
+        const double elapsedMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+        state.normalFitStatus = state.normalFitReady
+            ? "Surface fit ready (" + std::string(normalFitNeighborhoodName(state)) + "): " +
+                std::to_string(state.normalFitField.smoothedCoreCount) +
+                " core / " +
+                std::to_string(state.normalFitField.smoothedTransitionCount) +
+                " transition samples (" +
+                std::to_string(elapsedMilliseconds) + " ms)"
+            : "Surface fit produced no valid normals";
+        state.normalFieldReady = false;
+        state.normalField = {};
+        state.normalFieldStatus = "Normal field requires a fitted seed field";
+        state.normalFieldPreviewDirty = true;
+        return state.normalFitReady;
+    } catch (const std::exception& error) {
+        state.normalFitReady = false;
+        state.normalFitField = {};
+        state.normalFitStatus = std::string("Surface fit failed: ") + error.what();
+        state.normalFieldReady = false;
+        state.normalField = {};
+        state.normalFieldStatus = "Normal field is unavailable";
+        state.normalFieldPreviewDirty = true;
         return false;
     }
 }
@@ -1038,22 +1310,30 @@ bool rebuildSurfaceNormalField(ViewerState& state)
         state.normalFieldStatus = "Normal field requires a SurfaceTarget cache";
         return false;
     }
+    if (!state.normalFitReady ||
+        state.normalFitField.normals.size() != state.surfaceTargetCache->samples.size()) {
+        state.normalFieldReady = false;
+        state.normalField = {};
+        state.normalFieldStatus = "Build Surface Fit / Normal Seed first";
+        return false;
+    }
 
     try {
         const auto start = std::chrono::steady_clock::now();
         state.normalField = volume_surface::smoothSurfaceTargetNormals(
             *state.surfaceTargetCache,
+            state.normalFitField,
             state.normalSmoothingSettings);
         state.normalFieldReady = !state.normalField.empty();
         const double elapsedMilliseconds =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
         state.normalFieldStatus = state.normalFieldReady
-            ? "Normal field ready: " +
+            ? "Normal field ready (" + std::string(normalTrendNeighborhoodName(state)) +"): " +
                 std::to_string(state.normalField.smoothedCoreCount) +
-                " core / " +
+                " averaged core / " +
                 std::to_string(state.normalField.smoothedTransitionCount) +
-                " transition samples (" +
+                " averaged transition samples (" +
                 std::to_string(elapsedMilliseconds) + " ms)"
             : "Normal field produced no valid normals";
         state.normalFieldPreviewDirty = true;
@@ -1081,12 +1361,17 @@ void rebuildSurfaceTargetPreview(ViewerState& state, Engine& engine, Scene& scen
         ? state.grid->voxelSize()
         : openvdb::Vec3d{1.0, 1.0, 1.0};
     inputs.displayScale = state.displayScale;
-    if (state.surfaceTargetCache &&
-        state.normalFieldPreviewActive &&
-        state.normalFieldPreviewSmoothed &&
-        state.normalFieldReady &&
-        state.normalField.normals.size() == state.surfaceTargetCache->samples.size()) {
-        inputs.normalOverrides = &state.normalField.normals;
+    if (state.surfaceTargetCache) {
+        if (state.normalFitPreviewActive &&
+            state.normalFitReady &&
+            state.normalFitField.normals.size() == state.surfaceTargetCache->samples.size()) {
+            inputs.normalOverrides = &state.normalFitField.normals;
+        } else if (state.normalFieldPreviewActive &&
+                   state.normalFieldPreviewSmoothed &&
+                   state.normalFieldReady &&
+                   state.normalField.normals.size() == state.surfaceTargetCache->samples.size()) {
+            inputs.normalOverrides = &state.normalField.normals;
+        }
     }
     state.surfaceTargetPreview.rebuild(engine, scene, inputs);
     state.normalFieldPreviewDirty = false;
@@ -1147,6 +1432,14 @@ void rebuildReference(ViewerState& state, Engine& engine, Scene& scene)
         state.reconstructionCrossingCellCount = 0;
         state.reconstructionFieldSampleCount = 0;
         state.reconstructionSourceSupportFallbackCount = 0;
+        state.reconstructionProjectionVertexCount = 0;
+        state.reconstructionProjectionRejectedCount = 0;
+        state.reconstructionProjectionDensityRejectedCount = 0;
+        state.reconstructionProjectionMaximumDisplacement = 0.0;
+        state.reconstructionPickArmed = false;
+        state.reconstructionPickRequested = false;
+        state.reconstructionPickReport = {};
+        state.reconstructionPickStatus = "No reconstruction point has been picked";
         state.referenceIsoValue = state.isoValue;
         state.sliceDirty = true;
         updateReferenceTransform(state);
@@ -1180,10 +1473,14 @@ bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& sce
     state.reconstructionSettings.isoValue = state.isoValue;
     const auto start = std::chrono::steady_clock::now();
     try {
+        const auto* normalOverrides = hasUsableNormalField(state)
+            ? &state.normalField.normals
+            : nullptr;
         auto result = volume_surface::reconstructSurfaceMLS(
             *state.grid,
             *state.surfaceTargetCache,
-            state.reconstructionSettings);
+            state.reconstructionSettings,
+            normalOverrides);
         if (result.mesh.empty()) {
             state.reconstructionStatus =
                 "MLS reconstruction produced no triangles";
@@ -1202,15 +1499,24 @@ bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& sce
         state.reconstructionFieldSampleCount = result.fieldSampleCount;
         state.reconstructionSourceSupportFallbackCount =
             result.sourceSupportFallbackCount;
+        state.reconstructionProjectionVertexCount = result.projectionVertexCount;
+        state.reconstructionProjectionRejectedCount = result.projectionRejectedCount;
+        state.reconstructionProjectionDensityRejectedCount =
+            result.projectionDensityRejectedCount;
+        state.reconstructionProjectionMaximumDisplacement =
+            result.projectionMaximumDisplacement;
+        state.reconstructionPickArmed = false;
+        state.reconstructionPickRequested = false;
+        state.reconstructionPickReport = {};
+        state.reconstructionPickStatus = "No reconstruction point has been picked";
         state.reconstructionStatus =
             "Result A ready: " +
             std::to_string(resultSlot.mesh.vertices.size()) +
             " vertices / " +
             std::to_string(resultSlot.mesh.triangleCount()) +
             " triangles" +
-            (result.usedSourceTopologyFallback
-                ? " (closed source topology + MLS projection)"
-                : " (MLS/DC topology)");
+            " (source topology + MLS projection)" +
+            "; normals: " + reconstructionNormalSourceName(state);
         state.status = "Surface Reconstruction Result A ready";
         applyWorkflowPresentation(state, scene);
         return true;
@@ -1222,6 +1528,192 @@ bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& sce
             std::string("MLS reconstruction failed: ") + error.what();
         return false;
     }
+}
+
+bool surfaceTargetCoordinateLess(
+    const openvdb::Coord& left,
+    const openvdb::Coord& right)
+{
+    if (left.x() != right.x()) return left.x() < right.x();
+    if (left.y() != right.y()) return left.y() < right.y();
+    return left.z() < right.z();
+}
+
+bool findNearestSurfaceTargetSample(
+    const volume_surface::SurfaceTargetCache& cache,
+    const openvdb::FloatGrid& grid,
+    const openvdb::Vec3d& worldPosition,
+    volume_surface::viewer::ReconstructionPickReport& report)
+{
+    if (cache.samples.empty() || !worldPosition.isFinite()) {
+        return false;
+    }
+    const openvdb::Vec3d indexPosition = grid.worldToIndex(worldPosition);
+    if (!indexPosition.isFinite()) {
+        return false;
+    }
+    const openvdb::Coord center = openvdb::Coord::round(indexPosition);
+    constexpr int kSearchHalfExtent = 4;
+    double nearestDistanceSquared = std::numeric_limits<double>::infinity();
+    std::size_t nearestIndex = std::numeric_limits<std::size_t>::max();
+    for (int dz = -kSearchHalfExtent; dz <= kSearchHalfExtent; ++dz) {
+        for (int dy = -kSearchHalfExtent; dy <= kSearchHalfExtent; ++dy) {
+            for (int dx = -kSearchHalfExtent; dx <= kSearchHalfExtent; ++dx) {
+                const openvdb::Coord coordinate = center.offsetBy(dx, dy, dz);
+                const auto iterator = std::lower_bound(
+                    cache.samples.begin(),
+                    cache.samples.end(),
+                    coordinate,
+                    [](const volume_surface::SurfaceTargetSample& sample,
+                       const openvdb::Coord& value) {
+                        return surfaceTargetCoordinateLess(sample.coordinate, value);
+                    });
+                if (iterator == cache.samples.end() ||
+                    iterator->coordinate != coordinate) {
+                    continue;
+                }
+                const std::size_t sampleIndex = static_cast<std::size_t>(
+                    iterator - cache.samples.begin());
+                const openvdb::Vec3d delta =
+                    openvdb::Vec3d(iterator->worldPosition) - worldPosition;
+                const double distanceSquared = delta.lengthSqr();
+                if (distanceSquared < nearestDistanceSquared) {
+                    nearestDistanceSquared = distanceSquared;
+                    nearestIndex = sampleIndex;
+                }
+            }
+        }
+    }
+    if (nearestIndex == std::numeric_limits<std::size_t>::max()) {
+        return false;
+    }
+    report.targetSampleFound = true;
+    report.targetSampleIndex = nearestIndex;
+    report.targetSampleDistance = std::sqrt(nearestDistanceSquared);
+    report.targetSample = cache.samples[nearestIndex];
+    return true;
+}
+
+void rebuildPickedSurfaceFitPlane(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene)
+{
+    SurfaceFitPlaneRenderer::Inputs inputs;
+    const auto& report = state.reconstructionPickReport;
+    if (!report.hit) {
+        state.surfaceFitPlaneRenderer.rebuild(engine, scene, inputs);
+        return;
+    }
+
+    if (!report.targetSampleFound ||
+        !state.surfaceTargetCache ||
+        !state.normalFitReady ||
+        state.normalFitField.normals.size() != state.surfaceTargetCache->samples.size()) {
+        state.surfaceFitPlaneRenderer.rebuild(engine, scene, inputs);
+        return;
+    }
+
+    inputs.valid = true;
+    inputs.centerWorld = report.targetSampleFound
+        ? openvdb::Vec3d(report.targetSample.worldPosition)
+        : report.vdb.valid
+            ? report.vdb.worldPosition
+            : report.meshWorldPosition;
+    inputs.normalWorld = report.targetSampleFound
+        ? openvdb::Vec3d(report.targetSample.normal)
+        : report.vdb.normal;
+    inputs.normalWorld = openvdb::Vec3d(
+        state.normalFitField.normals[report.targetSampleIndex]);
+    inputs.referenceCenter = openvdb::Vec3d{
+        state.referenceCenter.x,
+        state.referenceCenter.y,
+        state.referenceCenter.z};
+    inputs.voxelSize = state.grid
+        ? state.grid->voxelSize()
+        : openvdb::Vec3d{1.0, 1.0, 1.0};
+    inputs.neighborhoodSide = normalFitNeighborhoodSide(state);
+    inputs.displayScale = state.displayScale;
+    state.surfaceFitPlaneRenderer.rebuild(engine, scene, inputs);
+}
+
+void processSurfaceFitPick(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene,
+    const View& view)
+{
+    if (!state.reconstructionPickRequested) {
+        return;
+    }
+    state.reconstructionPickRequested = false;
+    state.reconstructionPickReport = {};
+    rebuildPickedSurfaceFitPlane(state, engine, scene);
+    applyWorkflowPresentation(state, scene);
+    if (state.workflowController.stage() != WorkflowStage::SurfaceFit ||
+        !state.grid || !state.surfaceTargetCache ||
+        state.surfaceTargetCache->empty()) {
+        state.reconstructionPickStatus =
+            "Pick requires the Surface Fit stage and a SurfaceTarget cache";
+        return;
+    }
+
+    CameraPickRay ray;
+    if (!buildCameraPickRay(
+            view,
+            state.reconstructionPickX,
+            state.reconstructionPickY,
+            ray)) {
+        state.reconstructionPickStatus = "Unable to build a pick ray";
+        return;
+    }
+    std::array<bool, 4> visibleSlots{};
+    for (std::size_t index = 0; index < visibleSlots.size(); ++index) {
+        visibleSlots[index] = state.slots[index].visible;
+    }
+    const CameraPickHit hit = state.cameraPickController.pick(ray, visibleSlots);
+    if (!hit.hit) {
+        state.reconstructionPickStatus = "No visible mesh was hit";
+        return;
+    }
+
+    auto& report = state.reconstructionPickReport;
+    report.hit = true;
+    report.slotIndex = hit.slotIndex;
+    report.triangleIndex = hit.triangleIndex;
+    report.barycentric = hit.barycentric;
+    report.scenePosition = hit.scenePosition;
+    report.meshWorldPosition = state.context.coordinates.toWorld(
+        filament::math::float3{
+            static_cast<float>(hit.scenePosition.x()),
+            static_cast<float>(hit.scenePosition.y()),
+            static_cast<float>(hit.scenePosition.z())});
+
+    volume_surface::VdbSurfaceProbeSettings probeSettings;
+    probeSettings.isoValue = state.isoValue;
+    report.vdb = volume_surface::projectVdbSurface(
+        *state.grid,
+        report.meshWorldPosition,
+        probeSettings);
+    report.normalUsedByReconstruction = reconstructionNormalSourceName(state);
+    const openvdb::Vec3d targetPosition = report.vdb.valid
+        ? report.vdb.worldPosition
+        : report.meshWorldPosition;
+    findNearestSurfaceTargetSample(
+        *state.surfaceTargetCache,
+        *state.grid,
+        targetPosition,
+        report);
+    if (report.targetSampleFound && hasUsableNormalField(state)) {
+        report.smoothedNormal = openvdb::Vec3d(
+            state.normalField.normals[report.targetSampleIndex]);
+        report.smoothedNormalFound = report.smoothedNormal.lengthSqr() > 1.0e-20;
+    }
+    state.reconstructionPickStatus = report.vdb.converged
+        ? "Picked mesh and projected it to the VDB iso-surface"
+        : "Picked mesh; VDB projection did not converge, original point retained";
+    rebuildPickedSurfaceFitPlane(state, engine, scene);
+    applyWorkflowPresentation(state, scene);
 }
 
 void drawSlotControls(ViewerState& state, Engine& engine, Scene& scene, std::size_t index)
@@ -1470,7 +1962,7 @@ void drawSourceWindow(ViewerState& state)
     }
     ImGui::Separator();
     ImGui::TextWrapped(
-        "The source stage is read-only. Use Surface Validation to inspect density levels before editing downstream data.");
+        "The source stage is read-only. Use Surface Target to inspect the extracted surface data before editing downstream data.");
     ImGui::TextWrapped("Status: %s", state.status.c_str());
     ImGui::End();
 }
@@ -1585,69 +2077,249 @@ void drawSurfaceTargetWindow(ViewerState& state, Engine& engine, Scene& scene)
     ImGui::End();
 }
 
+void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
+{
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(390.0f, 760.0f), ImGuiCond_Once);
+    ImGui::SetNextWindowBgAlpha(1.0f);
+    ImGui::Begin("Surface Fit / Normal Seed");
+    state.mouseOverUi |= ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    ImGui::TextWrapped(
+        "Fit a local surface trend from the connected SurfaceTarget samples and generate seed normals.");
+    ImGui::TextWrapped(
+        "The neighborhood is selected in index space; no physical-radius resampling is used.");
+    ImGui::Separator();
+
+    auto& settings = state.normalFitSettings;
+    const char* neighborhoodLabels[] = {"3 x 3", "5 x 5", "9 x 9"};
+    int neighborhoodIndex = settings.neighborhood ==
+            volume_surface::SurfaceFitNeighborhood::Grid5x5
+        ? 1
+        : settings.neighborhood == volume_surface::SurfaceFitNeighborhood::Grid9x9
+            ? 2
+            : 0;
+    if (ImGui::Combo(
+            "Fit neighborhood",
+            &neighborhoodIndex,
+            neighborhoodLabels,
+            3)) {
+        settings.neighborhood = neighborhoodIndex == 2
+            ? volume_surface::SurfaceFitNeighborhood::Grid9x9
+            : neighborhoodIndex == 1
+                ? volume_surface::SurfaceFitNeighborhood::Grid5x5
+                : volume_surface::SurfaceFitNeighborhood::Grid3x3;
+        state.normalFitReady = false;
+        state.normalFitField = {};
+        state.normalFieldReady = false;
+        state.normalField = {};
+        state.normalFitStatus = "Surface fit settings changed; build the selected mode";
+        state.normalFieldStatus = "Normal field requires the updated fitted seed field";
+        state.normalFieldPreviewDirty = true;
+        rebuildPickedSurfaceFitPlane(state, engine, scene);
+        applyWorkflowPresentation(state, scene);
+    }
+    int robustIterations = static_cast<int>(std::clamp<std::size_t>(
+        settings.robustIterations,
+        1,
+        5));
+    if (ImGui::SliderInt("Fit robust iterations", &robustIterations, 1, 5)) {
+        settings.robustIterations = static_cast<std::size_t>(robustIterations);
+        state.normalFitReady = false;
+        state.normalFitField = {};
+        state.normalFieldReady = false;
+        state.normalField = {};
+        state.normalFitStatus = "Surface fit settings changed; build the selected mode";
+        state.normalFieldStatus = "Normal field requires the updated fitted seed field";
+        state.normalFieldPreviewDirty = true;
+        rebuildPickedSurfaceFitPlane(state, engine, scene);
+        applyWorkflowPresentation(state, scene);
+    }
+    ImGui::Text(
+        "Support: %s connected samples",
+        neighborhoodIndex == 2 ? "up to 81" : neighborhoodIndex == 1 ? "up to 25" : "up to 9");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Pick fitted surface plane");
+    if (ImGui::Button(
+            state.reconstructionPickArmed
+                ? "Click a surface point"
+                : "Pick surface point")) {
+        state.reconstructionPickArmed = true;
+        state.reconstructionPickStatus =
+            "Click a visible mesh in the viewer";
+    }
+    ImGui::SameLine();
+    ImGui::TextWrapped("%s", state.reconstructionPickStatus.c_str());
+
+    auto& planeSettings = state.surfaceFitPlaneRenderer.settings();
+    bool planeSettingsChanged = ImGui::Checkbox(
+        "Show fitted plane depth test",
+        &planeSettings.showPlane);
+    float planeDepthBias = planeSettings.depthBias;
+    if (ImGui::SliderFloat(
+            "Plane depth bias",
+            &planeDepthBias,
+            -4.0f,
+            4.0f,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp)) {
+        planeSettings.depthBias = planeDepthBias;
+        planeSettingsChanged = true;
+    }
+    ImGui::Text(
+        "Plane size follows the selected %s neighborhood",
+        neighborhoodLabels[neighborhoodIndex]);
+    if (planeSettingsChanged) {
+        rebuildPickedSurfaceFitPlane(state, engine, scene);
+        state.surfaceFitPlaneRenderer.updateMaterialSettings(engine);
+        applyWorkflowPresentation(state, scene);
+    }
+    if (state.reconstructionPickReport.hit) {
+        const auto& report = state.reconstructionPickReport;
+        ImGui::Text(
+            "Pick: slot %zu / triangle %zu",
+            report.slotIndex,
+            report.triangleIndex);
+        ImGui::Text(
+            "Mesh world: %.3f, %.3f, %.3f mm",
+            report.meshWorldPosition.x() * 1000.0,
+            report.meshWorldPosition.y() * 1000.0,
+            report.meshWorldPosition.z() * 1000.0);
+        if (report.vdb.valid) {
+            ImGui::Text(
+                "VDB iso: %.3f, %.3f, %.3f mm (residual %.3f)",
+                report.vdb.worldPosition.x() * 1000.0,
+                report.vdb.worldPosition.y() * 1000.0,
+                report.vdb.worldPosition.z() * 1000.0,
+                report.vdb.isoResidual);
+            ImGui::Text(
+                "Index: %.3f, %.3f, %.3f | displacement %.3f mm",
+                report.vdb.indexPosition.x(),
+                report.vdb.indexPosition.y(),
+                report.vdb.indexPosition.z(),
+                report.vdb.displacement * 1000.0);
+            ImGui::Text(
+                "Nearest voxel: (%d, %d, %d)",
+                report.vdb.nearestVoxel.x(),
+                report.vdb.nearestVoxel.y(),
+                report.vdb.nearestVoxel.z());
+        } else {
+            ImGui::TextUnformatted("VDB iso projection: unavailable");
+        }
+        if (report.targetSampleFound) {
+            ImGui::Text(
+                "Target: %s (%d, %d, %d), %.3f mm away",
+                report.targetSample.kind == volume_surface::SurfaceTargetSampleKind::Core
+                    ? "Core"
+                    : "Transition",
+                report.targetSample.coordinate.x(),
+                report.targetSample.coordinate.y(),
+                report.targetSample.coordinate.z(),
+                report.targetSampleDistance * 1000.0);
+        } else {
+            ImGui::TextUnformatted("Target sample: not found in local cache window");
+        }
+        if (ImGui::Button("Copy VDB location")) {
+            const std::string reportText =
+                volume_surface::viewer::formatReconstructionPickReportJsonl(
+                    report,
+                    state.input.string(),
+                    state.gridName,
+                    state.isoValue);
+            ImGui::SetClipboardText(reportText.c_str());
+            state.reconstructionPickStatus = "VDB location copied as JSONL";
+        }
+    }
+
+    if (ImGui::Button("Build / update fitted normals")) {
+        rebuildSurfaceNormalFit(state);
+        rebuildPickedSurfaceFitPlane(state, engine, scene);
+        state.normalFieldPreviewDirty = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextWrapped("%s", state.normalFitStatus.c_str());
+    bool previewChanged = ImGui::Checkbox(
+        "Show fitted normal vectors",
+        &state.surfaceTargetPreview.settings().showNormals);
+    previewChanged |= ImGui::Checkbox(
+        "Show points",
+        &state.surfaceTargetPreview.settings().showPoints);
+    if (previewChanged) {
+        state.normalFieldPreviewDirty = true;
+    }
+    ImGui::Text(
+        "Fitted samples: %zu core / %zu transition",
+        state.normalFitField.smoothedCoreCount,
+        state.normalFitField.smoothedTransitionCount);
+    ImGui::TextWrapped(
+        "This stage produces the seed field consumed by Surface Normal.");
+    ImGui::TextWrapped("Status: %s", state.status.c_str());
+    if (state.normalFieldPreviewDirty) {
+        rebuildSurfaceTargetPreview(state, engine, scene);
+    }
+    ImGui::End();
+}
+
 void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
 {
     ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(390.0f, 560.0f), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(1.0f);
-    ImGui::Begin("Normal Field");
+    ImGui::Begin("Surface Normal");
     state.mouseOverUi |= ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
     ImGui::TextWrapped(
-        "Smooth the normals attached to SurfaceTarget samples without moving the samples.");
+        "Optionally average the fitted surface normals without moving the SurfaceTarget samples.");
     ImGui::TextWrapped(
-        "The filtered field is preview-only in this first pass; Reconstruction still uses the raw field.");
+        "None keeps the Surface Fit / Normal Seed result unchanged.");
     ImGui::Separator();
 
     auto& settings = state.normalSmoothingSettings;
-    float radiusMillimeters = static_cast<float>(settings.radius * 1000.0);
-    if (ImGui::SliderFloat(
-            "Smoothing radius",
-            &radiusMillimeters,
-            0.5f,
-            20.0f,
-            "%.2f mm",
-            ImGuiSliderFlags_AlwaysClamp)) {
-        settings.radius = std::max(0.0005, static_cast<double>(radiusMillimeters) * 0.001);
+    const char* neighborhoodLabels[] = {
+        "None",
+        "3 x 3 connected",
+        "5 x 5 connected"};
+    int neighborhoodIndex = settings.neighborhood ==
+            volume_surface::SurfaceNormalNeighborhood::Grid3x3
+        ? 1
+        : settings.neighborhood == volume_surface::SurfaceNormalNeighborhood::Grid5x5
+            ? 2
+            : 0;
+    if (ImGui::Combo(
+            "Trend neighborhood",
+            &neighborhoodIndex,
+            neighborhoodLabels,
+            3)) {
+        settings.neighborhood = neighborhoodIndex == 2
+            ? volume_surface::SurfaceNormalNeighborhood::Grid5x5
+            : neighborhoodIndex == 1
+                ? volume_surface::SurfaceNormalNeighborhood::Grid3x3
+                : volume_surface::SurfaceNormalNeighborhood::None;
+        state.normalFieldReady = false;
+        state.normalFieldPreviewDirty = true;
+        state.normalFieldStatus = "Normal field settings changed; build the selected mode";
     }
+    ImGui::BeginDisabled(settings.neighborhood == volume_surface::SurfaceNormalNeighborhood::None);
     float strength = static_cast<float>(settings.strength);
-    if (ImGui::SliderFloat("Strength", &strength, 0.0f, 1.0f, "%.2f")) {
+    if (ImGui::SliderFloat("Trend strength", &strength, 0.0f, 1.0f, "%.2f")) {
         settings.strength = std::clamp(static_cast<double>(strength), 0.0, 1.0);
+        state.normalFieldReady = false;
+        state.normalFieldPreviewDirty = true;
+        state.normalFieldStatus = "Normal field settings changed; build the selected mode";
     }
-    int iterations = static_cast<int>(std::clamp<std::size_t>(settings.iterations, 1, 6));
-    if (ImGui::SliderInt("Iterations", &iterations, 1, 6)) {
-        settings.iterations = static_cast<std::size_t>(iterations);
+    int robustIterations = static_cast<int>(std::clamp<std::size_t>(
+        settings.robustIterations,
+        1,
+        5));
+    if (ImGui::SliderInt("Robust iterations", &robustIterations, 1, 5)) {
+        settings.robustIterations = static_cast<std::size_t>(robustIterations);
+        state.normalFieldReady = false;
+        state.normalFieldPreviewDirty = true;
+        state.normalFieldStatus = "Normal field settings changed; build the selected mode";
     }
-    float angleSigmaDegrees = static_cast<float>(
-        settings.angleSigmaRadians * 180.0 / 3.14159265358979323846);
-    if (ImGui::SliderFloat(
-            "Angle sigma",
-            &angleSigmaDegrees,
-            5.0f,
-            60.0f,
-            "%.1f deg")) {
-        settings.angleSigmaRadians = std::max(
-            1.0e-3,
-            static_cast<double>(angleSigmaDegrees) *
-                3.14159265358979323846 / 180.0);
-    }
-    float sheetThicknessMillimeters = static_cast<float>(settings.sheetThickness * 1000.0);
-    if (ImGui::SliderFloat(
-            "Sheet thickness",
-            &sheetThicknessMillimeters,
-            0.2f,
-            5.0f,
-            "%.2f mm")) {
-        settings.sheetThickness = std::max(
-            0.0001,
-            static_cast<double>(sheetThicknessMillimeters) * 0.001);
-    }
-    int maximumNeighbors = static_cast<int>(std::clamp<std::size_t>(
-        settings.maximumNeighbors,
-        8,
-        128));
-    if (ImGui::SliderInt("Maximum neighbors", &maximumNeighbors, 8, 128)) {
-        settings.maximumNeighbors = static_cast<std::size_t>(maximumNeighbors);
-    }
+    ImGui::EndDisabled();
+    ImGui::Text(
+        "Trend support: %s",
+        neighborhoodIndex == 2 ? "up to 25" : neighborhoodIndex == 1 ? "up to 9" : "disabled");
 
     if (ImGui::Button("Build / update normal field")) {
         rebuildSurfaceNormalField(state);
@@ -1656,7 +2328,7 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
     ImGui::SameLine();
     ImGui::TextWrapped("%s", state.normalFieldStatus.c_str());
     bool previewChanged = ImGui::Checkbox(
-        "Use smoothed normals",
+        "Preview with smoothed normals",
         &state.normalFieldPreviewSmoothed);
     ImGui::SameLine();
     previewChanged |= ImGui::Checkbox(
@@ -1669,7 +2341,7 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
         state.normalFieldPreviewDirty = true;
     }
     ImGui::Text(
-        "Samples: %zu / %zu",
+        "Averaged samples: %zu core / %zu transition",
         state.normalField.smoothedCoreCount,
         state.normalField.smoothedTransitionCount);
     ImGui::TextWrapped(
@@ -1703,6 +2375,7 @@ void drawUi(
     Scene& scene)
 {
     ViewerState& state = *statePointer;
+    processSurfaceFitPick(state, engine, scene, view);
     if (state.workflowController.stage() == WorkflowStage::WeightPainting) {
         state.brushInteractionController.processPendingCenter(state, engine, scene);
         state.brushInteractionController.processPendingStroke(state, engine, scene);
@@ -1721,38 +2394,11 @@ void drawUi(
         case WorkflowStage::Source:
             drawSourceWindow(state);
             break;
-        case WorkflowStage::Validation: {
-            ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Once);
-            ImGui::SetNextWindowSize(ImVec2(390.0f, 760.0f), ImGuiCond_Once);
-            ImGui::SetNextWindowBgAlpha(1.0f);
-            ImGui::Begin("Surface Validation");
-            state.mouseOverUi |= ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
-            ImGui::TextUnformatted("Data mode: Fog Volume");
-            ImGui::TextWrapped(
-                "Surface: density = isoValue (not an SDF zero level set)");
-            ImGui::Text("Grid: %s", state.gridName.c_str());
-            ImGui::TextWrapped("File: %s", state.input.string().c_str());
-            const auto& referenceBounds = state.slots[0].mesh.bounds;
-            ImGui::Text(
-                "Reference size: %.1f x %.1f x %.1f mm",
-                (referenceBounds.maximum[0] - referenceBounds.minimum[0]) * 1000.0f,
-                (referenceBounds.maximum[1] - referenceBounds.minimum[1]) * 1000.0f,
-                (referenceBounds.maximum[2] - referenceBounds.minimum[2]) * 1000.0f);
-            ImGui::Separator();
-            ImGui::InputFloat("Density iso", &state.isoValue, 1.0f, 10.0f, "%.3f");
-            ImGui::SliderFloat("Mesh adaptivity", &state.adaptivity, 0.0f, 1.0f, "%.3f");
-            if (ImGui::Button("Rebuild Reference")) {
-                rebuildReference(state, engine, scene);
-            }
-            ImGui::TextWrapped("Status: %s", state.status.c_str());
-            ImGui::Separator();
-            ImGui::TextWrapped(
-                "Inspect density slices, 255-level surface coverage, and reference bounds here. SDF conversion is not required.");
-            ImGui::End();
-            break;
-        }
         case WorkflowStage::SurfaceTarget:
             drawSurfaceTargetWindow(state, engine, scene);
+            break;
+        case WorkflowStage::SurfaceFit:
+            drawSurfaceFitWindow(state, engine, scene);
             break;
         case WorkflowStage::NormalField:
             drawNormalFieldWindow(state, engine, scene);
@@ -1776,6 +2422,14 @@ void drawUi(
                 state.reconstructionCrossingCellCount = 0;
                 state.reconstructionFieldSampleCount = 0;
                 state.reconstructionSourceSupportFallbackCount = 0;
+                state.reconstructionProjectionVertexCount = 0;
+                state.reconstructionProjectionRejectedCount = 0;
+                state.reconstructionProjectionDensityRejectedCount = 0;
+                state.reconstructionProjectionMaximumDisplacement = 0.0;
+                state.reconstructionPickArmed = false;
+                state.reconstructionPickRequested = false;
+                state.reconstructionPickReport = {};
+                state.reconstructionPickStatus = "No reconstruction point has been picked";
                 applyWorkflowPresentation(state, scene);
             }
             break;
@@ -1807,6 +2461,13 @@ std::unique_ptr<FilamentApp2> createViewer(
             {0.0f, 0.0f, 1.0f},
             {0.0f, 0.0f, -4.0f},
             {0.0f, 1.0f, 0.0f});
+        if (!state->headlessSmoke && !state->replayBrushProfile) {
+            view->setStencilBufferEnabled(true);
+        }
+        state->surfaceAwareCameraController.reset(
+            openvdb::Vec3d{0.0, 0.0, 1.0},
+            openvdb::Vec3d{0.0, 0.0, -4.0},
+            openvdb::Vec3d{0.0, 1.0, 0.0});
         view->setPostProcessingEnabled(true);
         state->context.lighting.create(
             *engine,
@@ -1885,7 +2546,7 @@ std::unique_ptr<FilamentApp2> createViewer(
                 throw std::runtime_error("Brush cursor renderable smoke test failed");
             }
             state->brushControlDown = false;
-            state->workflowController.setStage(WorkflowStage::Validation);
+            state->workflowController.setStage(WorkflowStage::Source);
             updateBrushCursorGeometry(*state, *engine, *scene, *view);
             std::cout << "brush.samples=" << state->brushResult.samples.size()
                       << " candidates=" << state->brushResult.candidateVoxelCount
@@ -1903,6 +2564,7 @@ std::unique_ptr<FilamentApp2> createViewer(
         destroyBrushCursorResources(*state, *engine, *scene);
         destroyBrushHeatmapResources(*state, *engine, *scene);
         state->surfaceTargetPreview.destroy(*engine, *scene);
+        state->surfaceFitPlaneRenderer.destroy(*engine, *scene);
         state->meshRenderer.destroyAll(*engine, *scene);
         for (auto& slot : state->slots) {
             slot.visible = false;
@@ -1930,6 +2592,11 @@ std::unique_ptr<FilamentApp2> createViewer(
         .headless(state->headlessSmoke || state->replayBrushProfile)
         .samples(4)
         .setup(std::move(setup))
+        .preRender([state](Engine*, View* view, Scene*, filament::Renderer*) {
+            if (view) {
+                state->surfaceAwareCameraController.applyTo(view->getCamera());
+            }
+        })
         .cleanup(std::move(cleanup))
         .imgui(std::move(imgui))
         .animation([state](Engine*, View*, double) {

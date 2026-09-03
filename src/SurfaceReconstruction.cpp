@@ -247,9 +247,12 @@ double wendlandC2(double normalizedDistance)
 std::vector<ReconstructionSample> localizeCoreSamples(
     const openvdb::FloatGrid& grid,
     const SurfaceTargetCache& target,
-    double isoValue)
+    double isoValue,
+    const std::vector<openvdb::Vec3f>* normalOverrides)
 {
     std::vector<ReconstructionSample> samples(target.samples.size());
+    const bool hasNormalOverrides = normalOverrides &&
+        normalOverrides->size() == target.samples.size();
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, target.samples.size()),
         [&](const tbb::blocked_range<std::size_t>& range) {
@@ -259,7 +262,13 @@ std::vector<ReconstructionSample> localizeCoreSamples(
                 auto& destination = samples[index];
                 destination.coordinate = source.coordinate;
                 destination.position = Vec3d(source.worldPosition);
-                destination.normal = Vec3d(source.normal);
+                destination.normal = hasNormalOverrides
+                    ? Vec3d((*normalOverrides)[index])
+                    : Vec3d(source.normal);
+                if (!destination.normal.isFinite() ||
+                    destination.normal.lengthSqr() <= 1.0e-20) {
+                    destination.normal = Vec3d(source.normal);
+                }
                 destination.supportWeight = source.supportWeight;
                 destination.core =
                     source.kind == SurfaceTargetSampleKind::Core;
@@ -736,6 +745,15 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
     const SurfaceTargetCache& target,
     const SurfaceReconstructionSettings& settings)
 {
+    return reconstructSurfaceMLS(sourceGrid, target, settings, nullptr);
+}
+
+SurfaceReconstructionResult reconstructSurfaceMLS(
+    const openvdb::FloatGrid& sourceGrid,
+    const SurfaceTargetCache& target,
+    const SurfaceReconstructionSettings& settings,
+    const std::vector<openvdb::Vec3f>* normalOverrides)
+{
     if (sourceGrid.getGridClass() != openvdb::GRID_FOG_VOLUME &&
         sourceGrid.getGridClass() != openvdb::GRID_LEVEL_SET) {
         throw std::invalid_argument("MLS reconstruction requires a fog volume or level set grid");
@@ -744,6 +762,7 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
         !std::isfinite(settings.mlsRadius) || settings.mlsRadius <= 0.0 ||
         !std::isfinite(settings.targetCellSize) || settings.targetCellSize <= 0.0 ||
         settings.maximumCellCount == 0 || settings.maximumSamplesPerFit < 6 ||
+        settings.projectionIterations == 0 ||
         !std::isfinite(settings.transitionGeometryWeight) ||
         settings.transitionGeometryWeight < 0.0 ||
         !std::isfinite(settings.minimumFogDensityFraction) ||
@@ -752,7 +771,9 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
         !std::isfinite(settings.sourceTopologyAdaptivity) ||
         settings.sourceTopologyAdaptivity < 0.0 ||
         settings.sourceTopologyAdaptivity > 1.0 ||
-        !std::isfinite(settings.regularization) || settings.regularization <= 0.0) {
+        !std::isfinite(settings.regularization) || settings.regularization <= 0.0 ||
+        !std::isfinite(settings.projectionMaximumDisplacement) ||
+        settings.projectionMaximumDisplacement <= 0.0) {
         throw std::invalid_argument("MLS reconstruction settings are invalid");
     }
     if (target.empty() || target.coreCount == 0) {
@@ -762,7 +783,11 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
     SurfaceReconstructionResult result;
     const auto totalStart = std::chrono::steady_clock::now();
     const auto anchorStart = totalStart;
-    auto samples = localizeCoreSamples(sourceGrid, target, settings.isoValue);
+    auto samples = localizeCoreSamples(
+        sourceGrid,
+        target,
+        settings.isoValue,
+        normalOverrides);
     labelSurfaceComponents(samples);
     result.timings.anchorLocalizationMilliseconds =
         std::chrono::duration<double, std::milli>(
@@ -774,6 +799,192 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - indexStart).count();
 
+    const auto topologyStart = std::chrono::steady_clock::now();
+    auto sourceTopology = extractIsoSurface(
+        sourceGrid,
+        settings.isoValue,
+        settings.sourceTopologyAdaptivity);
+    if (sourceTopology.empty()) {
+        result.timings.meshExtractionMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - topologyStart).count();
+        result.timings.totalMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - totalStart).count();
+        return result;
+    }
+
+    result.projectionVertexCount = sourceTopology.vertices.size();
+    result.candidateCellCount = result.projectionVertexCount;
+    result.fieldSampleCount = result.projectionVertexCount;
+    result.crossingCellCount = sourceTopology.triangleCount();
+    result.sourceCrossingCellCount = sourceTopology.triangleCount();
+    result.emittedFaceCount = sourceTopology.triangleCount();
+
+    const openvdb::tools::GridSampler<
+        openvdb::FloatGrid,
+        openvdb::tools::BoxSampler> projectionSampler(sourceGrid);
+    const double maximumDisplacement = settings.projectionMaximumDisplacement;
+    const double maximumStep = std::min(
+        settings.mlsRadius,
+        maximumDisplacement /
+            static_cast<double>(std::max<std::size_t>(1, settings.projectionIterations)));
+    const double minimumDensity = settings.isoValue *
+        settings.minimumFogDensityFraction;
+    const bool useDensityGuard = sourceGrid.getGridClass() == openvdb::GRID_FOG_VOLUME;
+    std::vector<std::uint8_t> projectionFallbackFlags(
+        sourceTopology.vertices.size(),
+        0);
+    std::vector<std::uint8_t> projectionRejectedFlags(
+        sourceTopology.vertices.size(),
+        0);
+    std::vector<std::uint8_t> projectionDensityRejectedFlags(
+        sourceTopology.vertices.size(),
+        0);
+    std::vector<double> projectionDisplacements(
+        sourceTopology.vertices.size(),
+        0.0);
+    const auto projectionStart = std::chrono::steady_clock::now();
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, sourceTopology.vertices.size()),
+        [&](const tbb::blocked_range<std::size_t>& range) {
+            for (std::size_t index = range.begin(); index != range.end(); ++index) {
+                auto& vertex = sourceTopology.vertices[index];
+                const Vec3d originalPosition(
+                    static_cast<double>(vertex.position[0]),
+                    static_cast<double>(vertex.position[1]),
+                    static_cast<double>(vertex.position[2]));
+                Vec3d position = originalPosition;
+                bool projected = false;
+                bool rejected = false;
+                bool densityRejected = false;
+                for (std::size_t iteration = 0;
+                     iteration < settings.projectionIterations;
+                     ++iteration) {
+                    const auto sample = field.evaluate(position);
+                    if (!sample.valid) {
+                        rejected = true;
+                        break;
+                    }
+                    const double correction = std::clamp(
+                        sample.value,
+                        -settings.mlsRadius,
+                        settings.mlsRadius);
+                    if (std::abs(correction) <= 1.0e-9) {
+                        projected = true;
+                        break;
+                    }
+                    Vec3d step = -sample.normal * correction;
+                    const double stepLength = step.length();
+                    if (!std::isfinite(stepLength) || stepLength <= 1.0e-12) {
+                        rejected = true;
+                        break;
+                    }
+                    if (stepLength > maximumStep) {
+                        step *= maximumStep / stepLength;
+                    }
+                    const double currentDisplacement =
+                        (position - originalPosition).length();
+                    const double remainingDisplacement = maximumDisplacement -
+                        currentDisplacement;
+                    if (remainingDisplacement <= 1.0e-12) {
+                        rejected = true;
+                        break;
+                    }
+                    if (step.length() > remainingDisplacement) {
+                        step *= remainingDisplacement / step.length();
+                    }
+
+                    Vec3d candidate = position + step;
+                    bool accepted = false;
+                    for (int lineSearch = 0; lineSearch < 6; ++lineSearch) {
+                        const double density = projectionSampler.wsSample(candidate);
+                        const bool densitySafe = !useDensityGuard ||
+                            (std::isfinite(density) && density >= minimumDensity);
+                        if (candidate.isFinite() && densitySafe) {
+                            accepted = true;
+                            break;
+                        }
+                        step *= 0.5;
+                        candidate = position + step;
+                    }
+                    if (!accepted) {
+                        rejected = true;
+                        densityRejected = useDensityGuard;
+                        break;
+                    }
+                    position = candidate;
+                    projected = true;
+                }
+                if (!projected) {
+                    projectionFallbackFlags[index] = 1;
+                }
+                if (rejected) {
+                    projectionRejectedFlags[index] = 1;
+                }
+                if (densityRejected) {
+                    projectionDensityRejectedFlags[index] = 1;
+                }
+                projectionDisplacements[index] =
+                    (position - originalPosition).length();
+                vertex.position = {
+                    static_cast<float>(position.x()),
+                    static_cast<float>(position.y()),
+                    static_cast<float>(position.z())};
+            }
+        });
+    result.timings.fieldSamplingMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - projectionStart).count();
+    result.sourceTopologyProjectionFallbackCount = static_cast<std::size_t>(
+        std::count(
+            projectionFallbackFlags.begin(),
+            projectionFallbackFlags.end(),
+            static_cast<std::uint8_t>(1)));
+    result.projectionRejectedCount = static_cast<std::size_t>(
+        std::count(
+            projectionRejectedFlags.begin(),
+            projectionRejectedFlags.end(),
+            static_cast<std::uint8_t>(1)));
+    result.projectionDensityRejectedCount = static_cast<std::size_t>(
+        std::count(
+            projectionDensityRejectedFlags.begin(),
+            projectionDensityRejectedFlags.end(),
+            static_cast<std::uint8_t>(1)));
+    result.sourceSupportFallbackCount = result.projectionDensityRejectedCount;
+    result.projectionMaximumDisplacement = *std::max_element(
+        projectionDisplacements.begin(),
+        projectionDisplacements.end());
+    calculateMeshNormals(sourceTopology);
+    if (!sourceTopology.vertices.empty()) {
+        const float infinity = std::numeric_limits<float>::infinity();
+        sourceTopology.bounds.minimum = {infinity, infinity, infinity};
+        sourceTopology.bounds.maximum = {-infinity, -infinity, -infinity};
+        for (const auto& vertex : sourceTopology.vertices) {
+            for (std::size_t axis = 0; axis < 3; ++axis) {
+                sourceTopology.bounds.minimum[axis] = std::min(
+                    sourceTopology.bounds.minimum[axis],
+                    vertex.position[axis]);
+                sourceTopology.bounds.maximum[axis] = std::max(
+                    sourceTopology.bounds.maximum[axis],
+                    vertex.position[axis]);
+            }
+        }
+    }
+    result.mesh = std::move(sourceTopology);
+    result.usedSourceTopologyFallback = false;
+    result.missingNeighborFaceCount = 0;
+    result.timings.meshExtractionMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - topologyStart).count();
+    result.timings.totalMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - totalStart).count();
+    return result;
+
+#if 0
+    // The former direct MLS/DC topology path is retained only for historical
+    // comparison; source-topology projection above is the sole runtime path.
     Vec3d minimum(
         std::numeric_limits<double>::infinity(),
         std::numeric_limits<double>::infinity(),
@@ -1188,6 +1399,7 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - totalStart).count();
     return result;
+#endif
 }
 
 } // namespace volume_surface

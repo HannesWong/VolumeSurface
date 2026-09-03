@@ -1,0 +1,21 @@
+material {
+    name : SurfaceFitPlane,
+    shadingModel : unlit,
+    blending : transparent,
+    culling : none,
+    depthWrite : false,
+    depthCulling : true,
+    parameters : [
+        {
+            type : float4,
+            name : BASE_COLOR
+        }
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor = materialParams.BASE_COLOR;
+    }
+}

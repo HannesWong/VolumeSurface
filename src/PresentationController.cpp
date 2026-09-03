@@ -11,6 +11,7 @@ void PresentationController::apply(
     MeshRenderer& meshRenderer,
     std::array<MeshSlot, 4>& slots,
     SurfaceTargetPreview& surfaceTargetPreview,
+    SurfaceFitPlaneRenderer& surfaceFitPlaneRenderer,
     BrushHeatmapRenderer& brushHeatmap,
     const State& state) const
 {
@@ -30,6 +31,11 @@ void PresentationController::apply(
     }
 
     surfaceTargetPreview.setVisible(scene, state.surfaceTargetStage);
+    surfaceFitPlaneRenderer.setVisible(
+        scene,
+        state.surfaceFitStage &&
+            state.surfaceFitPlaneAvailable &&
+            state.showSurfaceFitMesh);
     brushHeatmap.setVisible(scene, state.weightPaintingStage);
 }
 

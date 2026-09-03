@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include <openvdb/math/Stencils.h>
+
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_sort.h>
@@ -34,285 +36,6 @@ struct CoordHasher
     }
 };
 
-struct SpatialBucketKey
-{
-    int x = 0;
-    int y = 0;
-    int z = 0;
-
-    [[nodiscard]] bool operator==(const SpatialBucketKey& other) const noexcept
-    {
-        return x == other.x && y == other.y && z == other.z;
-    }
-};
-
-struct SpatialBucketHasher
-{
-    [[nodiscard]] std::size_t operator()(const SpatialBucketKey& key) const noexcept
-    {
-        std::size_t value = static_cast<std::uint32_t>(key.x);
-        value = (value * 0x9e3779b9U) ^ static_cast<std::uint32_t>(key.y);
-        value = (value * 0x9e3779b9U) ^ static_cast<std::uint32_t>(key.z);
-        return value;
-    }
-};
-
-class CoreSpatialIndex
-{
-public:
-    CoreSpatialIndex(const SurfaceTargetCache& cache, double cellSize)
-        : mCache(&cache)
-        , mCellSize(std::max(cellSize, 1.0e-9))
-    {
-        bool hasOrigin = false;
-        for (std::size_t index = 0; index < cache.samples.size(); ++index) {
-            if (cache.samples[index].kind != SurfaceTargetSampleKind::Core) {
-                continue;
-            }
-            const openvdb::Vec3d position(cache.samples[index].worldPosition);
-            if (!hasOrigin) {
-                mOrigin = position;
-                hasOrigin = true;
-            } else {
-                mOrigin.x() = std::min(mOrigin.x(), position.x());
-                mOrigin.y() = std::min(mOrigin.y(), position.y());
-                mOrigin.z() = std::min(mOrigin.z(), position.z());
-            }
-        }
-        mBuckets.reserve(cache.coreCount / 2 + 1);
-        if (!hasOrigin) {
-            return;
-        }
-        for (std::size_t index = 0; index < cache.samples.size(); ++index) {
-            if (cache.samples[index].kind == SurfaceTargetSampleKind::Core) {
-                mBuckets[bucketFor(openvdb::Vec3d(cache.samples[index].worldPosition))]
-                    .push_back(index);
-            }
-        }
-    }
-
-    template <typename Visitor>
-    void visit(const openvdb::Vec3d& position, double radius, Visitor&& visitor) const
-    {
-        const double queryRadius = std::max(radius, 1.0e-9);
-        const double radiusSquared = queryRadius * queryRadius;
-        const SpatialBucketKey minimum = bucketFor(position - openvdb::Vec3d(queryRadius));
-        const SpatialBucketKey maximum = bucketFor(position + openvdb::Vec3d(queryRadius));
-        for (int z = minimum.z; z <= maximum.z; ++z) {
-            for (int y = minimum.y; y <= maximum.y; ++y) {
-                for (int x = minimum.x; x <= maximum.x; ++x) {
-                    const auto found = mBuckets.find(SpatialBucketKey{x, y, z});
-                    if (found == mBuckets.end()) {
-                        continue;
-                    }
-                    for (const std::size_t sampleIndex : found->second) {
-                        const openvdb::Vec3d delta =
-                            openvdb::Vec3d(mCache->samples[sampleIndex].worldPosition) - position;
-                        const double distanceSquared = delta.lengthSqr();
-                        if (distanceSquared <= radiusSquared) {
-                            visitor(sampleIndex, distanceSquared);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-private:
-    [[nodiscard]] SpatialBucketKey bucketFor(const openvdb::Vec3d& position) const
-    {
-        return SpatialBucketKey{
-            static_cast<int>(std::floor((position.x() - mOrigin.x()) / mCellSize)),
-            static_cast<int>(std::floor((position.y() - mOrigin.y()) / mCellSize)),
-            static_cast<int>(std::floor((position.z() - mOrigin.z()) / mCellSize))};
-    }
-
-    const SurfaceTargetCache* mCache = nullptr;
-    double mCellSize = 1.0;
-    openvdb::Vec3d mOrigin{0.0};
-    std::unordered_map<SpatialBucketKey, std::vector<std::size_t>, SpatialBucketHasher>
-        mBuckets;
-};
-
-openvdb::Vec3d smallestEigenvector(
-    const std::array<std::array<double, 3>, 3>& covariance)
-{
-    auto matrix = covariance;
-    std::array<std::array<double, 3>, 3> eigenvectors{{
-        {{1.0, 0.0, 0.0}},
-        {{0.0, 1.0, 0.0}},
-        {{0.0, 0.0, 1.0}}}};
-
-    for (int iteration = 0; iteration < 12; ++iteration) {
-        int p = 0;
-        int q = 1;
-        double largest = std::abs(matrix[0][1]);
-        if (std::abs(matrix[0][2]) > largest) {
-            p = 0;
-            q = 2;
-            largest = std::abs(matrix[0][2]);
-        }
-        if (std::abs(matrix[1][2]) > largest) {
-            p = 1;
-            q = 2;
-            largest = std::abs(matrix[1][2]);
-        }
-        if (largest <= 1.0e-14) {
-            break;
-        }
-
-        const double app = matrix[p][p];
-        const double aqq = matrix[q][q];
-        const double apq = matrix[p][q];
-        const double tau = (aqq - app) / (2.0 * apq);
-        const double t = (tau >= 0.0 ? 1.0 : -1.0) /
-            (std::abs(tau) + std::sqrt(1.0 + tau * tau));
-        const double cosine = 1.0 / std::sqrt(1.0 + t * t);
-        const double sine = t * cosine;
-
-        for (int k = 0; k < 3; ++k) {
-            if (k == p || k == q) {
-                continue;
-            }
-            const double mkp = matrix[k][p];
-            const double mkq = matrix[k][q];
-            matrix[k][p] = matrix[p][k] = cosine * mkp - sine * mkq;
-            matrix[k][q] = matrix[q][k] = sine * mkp + cosine * mkq;
-        }
-        matrix[p][p] = app - t * apq;
-        matrix[q][q] = aqq + t * apq;
-        matrix[p][q] = matrix[q][p] = 0.0;
-
-        for (int k = 0; k < 3; ++k) {
-            const double vkp = eigenvectors[k][p];
-            const double vkq = eigenvectors[k][q];
-            eigenvectors[k][p] = cosine * vkp - sine * vkq;
-            eigenvectors[k][q] = sine * vkp + cosine * vkq;
-        }
-    }
-
-    int smallest = 0;
-    if (matrix[1][1] < matrix[smallest][smallest]) {
-        smallest = 1;
-    }
-    if (matrix[2][2] < matrix[smallest][smallest]) {
-        smallest = 2;
-    }
-    openvdb::Vec3d result(
-        eigenvectors[0][smallest],
-        eigenvectors[1][smallest],
-        eigenvectors[2][smallest]);
-    const double length = result.length();
-    if (!std::isfinite(length) || length <= 1.0e-20) {
-        return openvdb::Vec3d(0.0);
-    }
-    return result / length;
-}
-
-bool fitCoreNormal(
-    const SurfaceTargetCache& cache,
-    const CoreSpatialIndex& spatialIndex,
-    std::size_t centerIndex,
-    double radius,
-    openvdb::Vec3d& normal)
-{
-    const openvdb::Vec3d center(cache.samples[centerIndex].worldPosition);
-    const double fitRadius = std::max(radius, 1.0e-9);
-    openvdb::Vec3d firstMoment(0.0);
-    std::array<std::array<double, 3>, 3> secondMoment{{
-        {{0.0, 0.0, 0.0}},
-        {{0.0, 0.0, 0.0}},
-        {{0.0, 0.0, 0.0}}}};
-    double weightSum = 0.0;
-    std::size_t neighborCount = 0;
-    spatialIndex.visit(center, fitRadius, [&](std::size_t index, double distanceSquared) {
-        const double distance = std::sqrt(std::max(distanceSquared, 0.0));
-        const double normalizedDistance = distance / fitRadius;
-        const double remaining = std::max(0.0, 1.0 - normalizedDistance);
-        const double weight = remaining * remaining * remaining * remaining *
-            (4.0 * normalizedDistance + 1.0);
-        if (weight <= 1.0e-12) {
-            return;
-        }
-        const openvdb::Vec3d delta =
-            openvdb::Vec3d(cache.samples[index].worldPosition) - center;
-        firstMoment += delta * weight;
-        secondMoment[0][0] += weight * delta.x() * delta.x();
-        secondMoment[0][1] += weight * delta.x() * delta.y();
-        secondMoment[0][2] += weight * delta.x() * delta.z();
-        secondMoment[1][0] += weight * delta.y() * delta.x();
-        secondMoment[1][1] += weight * delta.y() * delta.y();
-        secondMoment[1][2] += weight * delta.y() * delta.z();
-        secondMoment[2][0] += weight * delta.z() * delta.x();
-        secondMoment[2][1] += weight * delta.z() * delta.y();
-        secondMoment[2][2] += weight * delta.z() * delta.z();
-        weightSum += weight;
-        ++neighborCount;
-    });
-
-    constexpr std::size_t kMinimumNormalNeighbors = 6;
-    if (neighborCount < kMinimumNormalNeighbors || weightSum <= 1.0e-12) {
-        return false;
-    }
-    const openvdb::Vec3d mean = firstMoment / weightSum;
-    std::array<std::array<double, 3>, 3> covariance = secondMoment;
-    covariance[0][0] -= weightSum * mean.x() * mean.x();
-    covariance[0][1] -= weightSum * mean.x() * mean.y();
-    covariance[0][2] -= weightSum * mean.x() * mean.z();
-    covariance[1][0] -= weightSum * mean.y() * mean.x();
-    covariance[1][1] -= weightSum * mean.y() * mean.y();
-    covariance[1][2] -= weightSum * mean.y() * mean.z();
-    covariance[2][0] -= weightSum * mean.z() * mean.x();
-    covariance[2][1] -= weightSum * mean.z() * mean.y();
-    covariance[2][2] -= weightSum * mean.z() * mean.z();
-    normal = smallestEigenvector(covariance);
-    return normal.lengthSqr() > 1.0e-20;
-}
-
-void interpolateTransitionNormal(
-    SurfaceTargetCache& cache,
-    const CoreSpatialIndex& spatialIndex,
-    std::size_t sampleIndex,
-    double radius)
-{
-    auto& sample = cache.samples[sampleIndex];
-    const openvdb::Vec3d center(sample.worldPosition);
-    const double fitRadius = std::max(radius, 1.0e-9);
-    const openvdb::Vec3d reference(sample.normal);
-    const bool hasReference = reference.lengthSqr() > 1.0e-20;
-    openvdb::Vec3d normalSum(0.0);
-    openvdb::Vec3d firstNormal(0.0);
-    double weightSum = 0.0;
-    spatialIndex.visit(center, fitRadius, [&](std::size_t index, double distanceSquared) {
-        openvdb::Vec3d candidate(cache.samples[index].normal);
-        const double candidateLength = candidate.length();
-        if (!std::isfinite(candidateLength) || candidateLength <= 1.0e-20) {
-            return;
-        }
-        candidate /= candidateLength;
-        if (firstNormal.lengthSqr() <= 1.0e-20) {
-            firstNormal = candidate;
-        }
-        if (hasReference) {
-            if (candidate.dot(reference) < 0.0) {
-                candidate = -candidate;
-            }
-        } else if (candidate.dot(firstNormal) < 0.0) {
-            candidate = -candidate;
-        }
-        const double normalizedDistance = std::sqrt(std::max(distanceSquared, 0.0)) / fitRadius;
-        const double remaining = std::max(0.0, 1.0 - normalizedDistance);
-        const double weight = remaining * remaining * remaining * remaining *
-            (4.0 * normalizedDistance + 1.0);
-        normalSum += candidate * weight;
-        weightSum += weight;
-    });
-    const double length = normalSum.length();
-    if (weightSum > 1.0e-12 && std::isfinite(length) && length > 1.0e-20) {
-        sample.normal = openvdb::Vec3f(normalSum / length);
-    }
-}
-
 struct TransitionChunk
 {
     std::unordered_map<openvdb::Coord, std::uint8_t, CoordHasher> layers;
@@ -320,7 +43,7 @@ struct TransitionChunk
 
 constexpr std::array<char, 8> kSurfaceTargetCacheMagic{
     'V', 'S', 'T', 'A', 'R', 'G', 'T', '1'};
-constexpr std::uint32_t kSurfaceTargetCacheVersion = 2;
+constexpr std::uint32_t kSurfaceTargetCacheVersion = 4;
 constexpr std::uint64_t kMaximumCacheStringLength = 1ULL << 20;
 
 template <typename Value>
@@ -405,7 +128,72 @@ bool isInside(
         : value <= isoValue;
 }
 
-openvdb::Vec3f calculateNormal(
+struct SurfaceCrossings
+{
+    std::array<openvdb::Vec3d, 6> positions{};
+    std::size_t count = 0;
+};
+
+SurfaceCrossings collectCoreSurfaceCrossings(
+    const openvdb::FloatGrid& grid,
+    const openvdb::FloatGrid::ConstAccessor& accessor,
+    const openvdb::Coord& coordinate,
+    double centerValue,
+    double isoValue)
+{
+    const openvdb::Vec3d centerWorld = grid.indexToWorld(coordinate.asVec3d());
+    const bool centerInside = isInside(grid, centerValue, isoValue);
+    SurfaceCrossings crossings;
+    for (const auto& direction : kAxisNeighbors) {
+        const openvdb::Coord neighborCoordinate = coordinate + direction;
+        const double neighborValue = accessor.getValue(neighborCoordinate);
+        if (centerInside == isInside(grid, neighborValue, isoValue)) {
+            continue;
+        }
+        const double denominator = neighborValue - centerValue;
+        const double interpolation = std::abs(denominator) > 1.0e-12
+            ? std::clamp((isoValue - centerValue) / denominator, 0.0, 1.0)
+            : 0.5;
+        const openvdb::Vec3d neighborWorld =
+            grid.indexToWorld(neighborCoordinate.asVec3d());
+        crossings.positions[crossings.count++] = centerWorld +
+            (neighborWorld - centerWorld) * interpolation;
+    }
+    return crossings;
+}
+
+openvdb::Vec3d calculateSurfaceGradient(
+    const openvdb::FloatGrid& grid,
+    openvdb::math::BoxStencil<openvdb::FloatGrid>& stencil,
+    const openvdb::Vec3d& worldPosition)
+{
+    const openvdb::Vec3d indexPosition = grid.worldToIndex(worldPosition);
+    if (!indexPosition.isFinite()) {
+        return openvdb::Vec3d(0.0);
+    }
+    stencil.moveTo(indexPosition);
+    const auto sampledGradient = stencil.gradient(indexPosition);
+    openvdb::Vec3d worldGradient{
+        static_cast<double>(sampledGradient.x()),
+        static_cast<double>(sampledGradient.y()),
+        static_cast<double>(sampledGradient.z())};
+    if (grid.getGridClass() == openvdb::GRID_FOG_VOLUME) {
+        worldGradient = -worldGradient;
+    }
+    return worldGradient;
+}
+
+openvdb::Vec3f normalizeGradient(openvdb::Vec3d worldGradient)
+{
+    const double length = worldGradient.length();
+    if (!std::isfinite(length) || length <= 1.0e-20) {
+        return openvdb::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+    worldGradient /= length;
+    return openvdb::Vec3f(worldGradient);
+}
+
+openvdb::Vec3f calculateVoxelCentralDifferenceNormal(
     const openvdb::FloatGrid& grid,
     const openvdb::FloatGrid::ConstAccessor& accessor,
     const openvdb::Coord& coordinate)
@@ -420,17 +208,12 @@ openvdb::Vec3f calculateNormal(
         0.5 * static_cast<double>(
             accessor.getValue(coordinate.offsetBy(0, 0, 1)) -
             accessor.getValue(coordinate.offsetBy(0, 0, -1)))};
-    openvdb::Vec3d worldNormal =
+    openvdb::Vec3d worldGradient =
         grid.transform().baseMap()->applyIJT(indexGradient, coordinate.asVec3d());
     if (grid.getGridClass() == openvdb::GRID_FOG_VOLUME) {
-        worldNormal = -worldNormal;
+        worldGradient = -worldGradient;
     }
-    const double length = worldNormal.length();
-    if (!std::isfinite(length) || length <= 1.0e-20) {
-        return openvdb::Vec3f(0.0f, 0.0f, 0.0f);
-    }
-    worldNormal /= length;
-    return openvdb::Vec3f(worldNormal);
+    return normalizeGradient(worldGradient);
 }
 
 float transitionSupport(
@@ -694,58 +477,50 @@ SurfaceTargetCache extractSurfaceTarget(
         cache.samples.push_back(sample);
     }
 
-    std::vector<openvdb::Vec3f> rawNormals(cache.samples.size());
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, cache.samples.size()),
         [&](const tbb::blocked_range<std::size_t>& range) {
+            openvdb::math::BoxStencil<openvdb::FloatGrid> workerStencil(grid);
             const auto workerAccessor = grid.getConstAccessor();
             for (std::size_t index = range.begin(); index != range.end(); ++index) {
-                const auto normal = calculateNormal(
-                    grid,
-                    workerAccessor,
-                    cache.samples[index].coordinate);
+                const auto& sample = cache.samples[index];
+                openvdb::Vec3f normal;
+                if (sample.kind == SurfaceTargetSampleKind::Core) {
+                    const auto crossings = collectCoreSurfaceCrossings(
+                        grid,
+                        workerAccessor,
+                        sample.coordinate,
+                        static_cast<double>(sample.density),
+                        settings.isoValue);
+                    openvdb::Vec3d normalSum(0.0);
+                    for (std::size_t crossingIndex = 0;
+                         crossingIndex < crossings.count;
+                         ++crossingIndex) {
+                        const openvdb::Vec3f crossingNormal = normalizeGradient(
+                            calculateSurfaceGradient(
+                                grid,
+                                workerStencil,
+                                crossings.positions[crossingIndex]));
+                        const openvdb::Vec3d direction(crossingNormal);
+                        if (direction.lengthSqr() <= 1.0e-20) {
+                            continue;
+                        }
+                        normalSum += direction;
+                    }
+                    normal = normalizeGradient(normalSum);
+                } else {
+                    normal = normalizeGradient(calculateSurfaceGradient(
+                        grid,
+                        workerStencil,
+                        openvdb::Vec3d(sample.worldPosition)));
+                }
+                if (normal.lengthSqr() <= 1.0e-20) {
+                    normal = calculateVoxelCentralDifferenceNormal(
+                        grid,
+                        workerAccessor,
+                        sample.coordinate);
+                }
                 cache.samples[index].normal = normal;
-                rawNormals[index] = normal;
-            }
-        });
-
-    CoreSpatialIndex coreSpatialIndex(cache, settings.normalRadius);
-    tbb::parallel_for(
-        tbb::blocked_range<std::size_t>(0, cache.samples.size()),
-        [&](const tbb::blocked_range<std::size_t>& range) {
-            for (std::size_t index = range.begin(); index != range.end(); ++index) {
-                auto& sample = cache.samples[index];
-                if (sample.kind != SurfaceTargetSampleKind::Core) {
-                    continue;
-                }
-                openvdb::Vec3d fittedNormal(0.0);
-                if (!fitCoreNormal(
-                        cache,
-                        coreSpatialIndex,
-                        index,
-                        settings.normalRadius,
-                        fittedNormal)) {
-                    continue;
-                }
-                const openvdb::Vec3d rawNormal(rawNormals[index]);
-                if (rawNormal.lengthSqr() > 1.0e-20 && fittedNormal.dot(rawNormal) < 0.0) {
-                    fittedNormal = -fittedNormal;
-                }
-                sample.normal = openvdb::Vec3f(fittedNormal);
-            }
-        });
-
-    tbb::parallel_for(
-        tbb::blocked_range<std::size_t>(0, cache.samples.size()),
-        [&](const tbb::blocked_range<std::size_t>& range) {
-            for (std::size_t index = range.begin(); index != range.end(); ++index) {
-                if (cache.samples[index].kind == SurfaceTargetSampleKind::Transition) {
-                    interpolateTransitionNormal(
-                        cache,
-                        coreSpatialIndex,
-                        index,
-                        settings.normalRadius);
-                }
             }
         });
 

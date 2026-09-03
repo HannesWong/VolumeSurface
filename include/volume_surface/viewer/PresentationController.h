@@ -5,6 +5,7 @@
 #include "volume_surface/SurfaceTargetPreview.h"
 #include "volume_surface/viewer/BrushHeatmapRenderer.h"
 #include "volume_surface/viewer/MeshRenderer.h"
+#include "volume_surface/viewer/SurfaceFitPlaneRenderer.h"
 
 namespace filament {
 class Scene;
@@ -20,6 +21,9 @@ public:
         bool showResults = false;
         bool showReferenceMesh = true;
         bool showSurfaceTargetMesh = true;
+        bool surfaceFitStage = false;
+        bool surfaceFitPlaneAvailable = false;
+        bool showSurfaceFitMesh = true;
     };
 
     void apply(
@@ -27,6 +31,7 @@ public:
         MeshRenderer& meshRenderer,
         std::array<MeshSlot, 4>& slots,
         SurfaceTargetPreview& surfaceTargetPreview,
+        SurfaceFitPlaneRenderer& surfaceFitPlaneRenderer,
         BrushHeatmapRenderer& brushHeatmap,
         const State& state) const;
 };

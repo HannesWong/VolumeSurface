@@ -6,8 +6,8 @@ namespace volume_surface::viewer {
 
 enum class WorkflowStage : std::uint8_t {
     Source,
-    Validation,
     SurfaceTarget,
+    SurfaceFit,
     NormalField,
     WeightPainting,
     Reconstruction,
@@ -22,7 +22,7 @@ public:
     bool setStage(WorkflowStage stage) noexcept;
 
 private:
-    WorkflowStage mStage = WorkflowStage::Validation;
+    WorkflowStage mStage = WorkflowStage::Source;
 };
 
 [[nodiscard]] const char* workflowStageName(WorkflowStage stage) noexcept;

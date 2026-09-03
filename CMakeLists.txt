@@ -38,6 +38,7 @@ add_library(volume_surface_mesh
     src/SurfaceTarget.cpp
     src/SurfaceReconstruction.cpp
     src/SurfaceNormalField.cpp
+    src/VdbSurfaceProbe.cpp
 )
 
 target_include_directories(volume_surface_mesh
@@ -59,6 +60,8 @@ target_compile_definitions(volume_surface_mesh
 # cannot be parsed by Ninja's dependency scanner.
 set(_surface_target_header
     "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceTarget.h")
+set(_surface_normal_field_header
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceNormalField.h")
 set_source_files_properties(
     src/SurfaceTarget.cpp
     src/SurfaceReconstruction.cpp
@@ -66,7 +69,7 @@ set_source_files_properties(
     src/reconstruction_info.cpp
     tests/SurfaceReconstructionTests.cpp
     tests/SurfaceTargetTests.cpp
-    PROPERTIES OBJECT_DEPENDS "${_surface_target_header}")
+    PROPERTIES OBJECT_DEPENDS "${_surface_target_header};${_surface_normal_field_header}")
 
 add_executable(vdb_brick_cache
     src/main.cpp
@@ -117,6 +120,8 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
     set(_surface_target_points_package "${_viewer_material_dir}/surfaceTargetPoints.filamat")
     set(_surface_target_debug_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceTargetDebug.mat")
     set(_surface_target_debug_package "${_viewer_material_dir}/surfaceTargetDebug.filamat")
+    set(_surface_fit_plane_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitPlane.mat")
+    set(_surface_fit_plane_package "${_viewer_material_dir}/surfaceFitPlane.filamat")
     add_custom_command(
         OUTPUT "${_brush_heatmap_package}"
         COMMAND matc ${MATC_BASE_FLAGS}
@@ -157,6 +162,16 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         COMMENT "Compiling SurfaceTarget debug material"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${_surface_fit_plane_package}"
+        COMMAND matc ${MATC_BASE_FLAGS}
+            -o "${_surface_fit_plane_package}"
+            "${_surface_fit_plane_source}"
+        MAIN_DEPENDENCY "${_surface_fit_plane_source}"
+        DEPENDS matc
+        COMMENT "Compiling SurfaceFit plane material"
+        VERBATIM
+    )
 
     get_resgen_vars("${_viewer_resource_dir}" volume_surface_viewer_resources)
     add_custom_command(
@@ -166,11 +181,13 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             "${_brush_cursor_package}"
             "${_surface_target_points_package}"
             "${_surface_target_debug_package}"
+            "${_surface_fit_plane_package}"
         DEPENDS resgen
             "${_brush_heatmap_package}"
             "${_brush_cursor_package}"
             "${_surface_target_points_package}"
             "${_surface_target_debug_package}"
+            "${_surface_fit_plane_package}"
         COMMENT "Embedding viewer materials"
         VERBATIM
     )
@@ -190,6 +207,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         src/viewer.cpp
         src/BrushCursorRenderer.cpp
         src/CameraPickController.cpp
+        src/SurfaceAwareCameraController.cpp
         src/BrushHeatmapRenderer.cpp
         src/BrushInteractionController.cpp
         src/BrushPaintingPanel.cpp
@@ -199,8 +217,10 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         src/MeshRenderer.cpp
         src/PresentationController.cpp
         src/ReconstructionPanel.cpp
+        src/ReconstructionPick.cpp
         src/SliceRenderer.cpp
         src/SurfaceTargetPreview.cpp
+        src/SurfaceFitPlaneRenderer.cpp
         src/SurfaceTargetCacheRepository.cpp
         src/WorkflowController.cpp
         src/WorkflowPanel.cpp
@@ -223,15 +243,17 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
 
     set(_viewer_state_header
         "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/viewer/ViewerState.h")
+    set(_document_session_header
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/viewer/DocumentSession.h")
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushInteractionController.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushPaintingPanel.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ReconstructionPanel.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/WorkflowPanel.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetCacheRepository.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetCacheRepository.cpp"
         PROPERTIES OBJECT_DEPENDS
-            "${_surface_target_header};${_viewer_state_header}")
+            "${_surface_target_header};${_surface_normal_field_header};${_viewer_state_header};${_document_session_header}")
 
     volume_surface_copy_openvdb_runtime(volume_surface_viewer)
 endif()

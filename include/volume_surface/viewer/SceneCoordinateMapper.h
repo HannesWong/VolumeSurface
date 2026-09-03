@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include <openvdb/openvdb.h>
 
 #include <math/vec3.h>
@@ -51,6 +53,18 @@ public:
                     static_cast<float>(mReferenceCenter.z())}) *
                 mDisplayScale +
             filament::math::float3{0.0f, 0.0f, -4.0f};
+    }
+
+    [[nodiscard]] openvdb::Vec3d toWorld(
+        const filament::math::float3& scenePosition) const noexcept
+    {
+        if (!std::isfinite(mDisplayScale) || std::abs(mDisplayScale) <= 1.0e-12f) {
+            return mReferenceCenter;
+        }
+        return mReferenceCenter + openvdb::Vec3d{
+            static_cast<double>(scenePosition.x) / mDisplayScale,
+            static_cast<double>(scenePosition.y) / mDisplayScale,
+            (static_cast<double>(scenePosition.z) + 4.0) / mDisplayScale};
     }
 
     [[nodiscard]] float displayScale() const noexcept

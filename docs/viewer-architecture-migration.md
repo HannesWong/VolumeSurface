@@ -2,7 +2,7 @@
 
 ## 目标
 
-将 `src/viewer.cpp` 从功能实现文件收敛为 Viewer 应用组装层。算法数据、工作流阶段、Filament 展示资源和 ImGui 面板分别拥有稳定边界，同时保持现有 Surface Validation、Surface Target、Weight Painting、Reconstruction 和 Review 的行为不变。
+将 `src/viewer.cpp` 从功能实现文件收敛为 Viewer 应用组装层。算法数据、工作流阶段、Filament 展示资源和 ImGui 面板分别拥有稳定边界，同时保持现有 Source VDB、Surface Target、Surface Fit / Normal Seed、Surface Normal、Weight Painting、Reconstruction 和 Review 的行为不变。
 
 ## 模块边界
 
@@ -45,7 +45,7 @@
 
 ## 后续迁移顺序
 
-完成渲染资源拆分后，再依次迁移 `WeightPaintingStage`、`ReconstructionStage`、Validation UI 和 Workflow UI。每一步都必须先保持 headless smoke 和现有阶段切换行为，再删除 viewer.cpp 中对应的旧实现。
+完成渲染资源拆分后，再依次迁移 `WeightPaintingStage`、`ReconstructionStage`、Surface Normal UI 和 Workflow UI。每一步都必须先保持 headless smoke 和现有阶段切换行为，再删除 viewer.cpp 中对应的旧实现。
 
 ## 验证标准
 

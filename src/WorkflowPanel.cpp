@@ -131,8 +131,8 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
 
     const std::array<WorkflowStage, 7> stages{
         WorkflowStage::Source,
-        WorkflowStage::Validation,
         WorkflowStage::SurfaceTarget,
+        WorkflowStage::SurfaceFit,
         WorkflowStage::NormalField,
         WorkflowStage::WeightPainting,
         WorkflowStage::Reconstruction,
@@ -144,7 +144,7 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
         ImVec2(10.0f + (nodeWidth + nodeGap) * 3.0f, 10.0f),
         ImVec2(10.0f + (nodeWidth + nodeGap) * 3.0f, 10.0f + nodeHeight + rowGap),
         ImVec2(10.0f + (nodeWidth + nodeGap) * 2.0f, 10.0f + nodeHeight + rowGap),
-        ImVec2(10.0f + (nodeWidth + nodeGap), 10.0f + nodeHeight + rowGap)};
+        ImVec2(10.0f + nodeWidth + nodeGap, 10.0f + nodeHeight + rowGap)};
 
     auto topLeftFor = [&](std::size_t index) {
         return ImVec2{
@@ -181,7 +181,7 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
     }
 
     ImVec2 sourceDataStart = topLeftFor(0);
-    ImVec2 targetDataEnd = topLeftFor(2);
+    ImVec2 targetDataEnd = topLeftFor(1);
     sourceDataStart.x += nodeWidth * 0.5f;
     sourceDataStart.y += nodeHeight;
     targetDataEnd.x += nodeWidth * 0.5f;
@@ -189,6 +189,12 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
     sourceDataStart.y += 8.0f;
     targetDataEnd.y += 8.0f;
     drawDashedArrow(drawList, sourceDataStart, targetDataEnd, dataColor, 1.5f);
+
+    ImVec2 fitDataStart = centerFor(2);
+    ImVec2 normalDataEnd = centerFor(3);
+    fitDataStart.x += nodeWidth * 0.5f;
+    normalDataEnd.x -= nodeWidth * 0.5f;
+    drawDashedArrow(drawList, fitDataStart, normalDataEnd, dataColor, 1.5f);
 
     ImVec2 normalDataStart = centerFor(3);
     ImVec2 reconstructionDataEnd = centerFor(5);
@@ -212,8 +218,10 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
         const WorkflowStage stage = stages[index];
         const bool ready = stage == WorkflowStage::Source
             ? state.grid != nullptr
-            : stage == WorkflowStage::NormalField
+            : stage == WorkflowStage::SurfaceFit
                 ? state.surfaceTargetCache && !state.surfaceTargetCache->empty()
+            : stage == WorkflowStage::NormalField
+                ? state.normalFitReady
                 : state.slots[0].available();
         const ImVec2 topLeft = topLeftFor(index);
         ImGui::SetCursorScreenPos(topLeft);
@@ -246,15 +254,15 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
             1.5f);
         const char* title = stage == WorkflowStage::SurfaceTarget
             ? "Surface Target"
+            : stage == WorkflowStage::SurfaceFit
+                ? "Surface Fit"
             : stage == WorkflowStage::NormalField
-                ? "Normal Field"
+                ? "Surface Normal"
             : stage == WorkflowStage::WeightPainting
                 ? "Weight Painting"
                 : stage == WorkflowStage::Reconstruction
                     ? "Reconstruction"
-                    : stage == WorkflowStage::Validation
-                        ? "Validation"
-                        : stage == WorkflowStage::Review
+                    : stage == WorkflowStage::Review
                             ? "Review / Export"
                             : "Source VDB";
         drawList->AddText(
@@ -273,8 +281,10 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
                 ImGui::TextUnformatted("Reference surface is not available");
             } else if (stage == WorkflowStage::SurfaceTarget) {
                 ImGui::TextUnformatted("Reference surface and BVH preview");
+            } else if (stage == WorkflowStage::SurfaceFit) {
+                ImGui::TextUnformatted("Fit local surface trends and generate seed normals");
             } else if (stage == WorkflowStage::NormalField) {
-                ImGui::TextUnformatted("Adjust and inspect the filtered normal field");
+                ImGui::TextUnformatted("Adjust and inspect the surface normal trend");
             } else if (stage == WorkflowStage::WeightPainting) {
                 ImGui::TextUnformatted("Paint and save surface weight fields");
             } else if (stage == WorkflowStage::Reconstruction) {

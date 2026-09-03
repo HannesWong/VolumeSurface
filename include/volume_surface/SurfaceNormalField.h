@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include <openvdb/openvdb.h>
@@ -9,14 +10,30 @@
 
 namespace volume_surface {
 
+enum class SurfaceFitNeighborhood : std::uint8_t {
+    Grid3x3,
+    Grid5x5,
+    Grid9x9,
+};
+
+enum class SurfaceNormalNeighborhood : std::uint8_t {
+    None,
+    Grid3x3,
+    Grid5x5,
+};
+
+struct SurfaceNormalFitSettings
+{
+    SurfaceFitNeighborhood neighborhood = SurfaceFitNeighborhood::Grid3x3;
+    std::size_t robustIterations = 2;
+    double isoValue = 255.0;
+};
+
 struct SurfaceNormalSmoothingSettings
 {
-    double radius = 0.005;
-    double strength = 0.5;
-    std::size_t iterations = 2;
-    double angleSigmaRadians = 0.3490658503988659;
-    double sheetThickness = 0.0015;
-    std::size_t maximumNeighbors = 64;
+    SurfaceNormalNeighborhood neighborhood = SurfaceNormalNeighborhood::None;
+    double strength = 1.0;
+    std::size_t robustIterations = 2;
 };
 
 struct SurfaceNormalField
@@ -28,6 +45,20 @@ struct SurfaceNormalField
 
     [[nodiscard]] bool empty() const noexcept { return normals.empty(); }
 };
+
+SurfaceNormalField fitSurfaceTargetNormals(
+    const SurfaceTargetCache& target,
+    const SurfaceNormalFitSettings& settings = {});
+
+SurfaceNormalField fitSurfaceTargetNormals(
+    const openvdb::FloatGrid& grid,
+    const SurfaceTargetCache& target,
+    const SurfaceNormalFitSettings& settings = {});
+
+SurfaceNormalField smoothSurfaceTargetNormals(
+    const SurfaceTargetCache& target,
+    const SurfaceNormalField& seed,
+    const SurfaceNormalSmoothingSettings& settings = {});
 
 SurfaceNormalField smoothSurfaceTargetNormals(
     const SurfaceTargetCache& target,

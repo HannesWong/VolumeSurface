@@ -77,10 +77,10 @@ MLS 结果先形成连续的点驱动隐式场，再用 Dual Contouring 生成�
 主流程保持：
 
 ```text
-Source VDB → Surface Validation → Surface Target → Weight Painting → Surface Reconstruction → Review / Export
+Source VDB → Surface Target → Surface Fit / Normal Seed → Surface Normal → Weight Painting → Surface Reconstruction → Review / Export
 ```
 
-Slice Comparison 继续作为独立 Inspector。Surface Target 负责确认正式样本和 BVH，Weight Painting 只修改 WeightField，Reconstruction 只读取两者并产生结果。
+Slice Comparison 继续作为独立 Inspector。Surface Target 负责确认正式样本和 BVH，Surface Fit / Normal Seed 生成法线种子，Surface Normal 可选地继续做邻域平均，Weight Painting 只修改 WeightField，Reconstruction 只读取这些结果并产生网格。
 
 ## 实现顺序
 

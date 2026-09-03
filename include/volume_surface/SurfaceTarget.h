@@ -33,6 +33,7 @@ struct SurfaceTargetSettings
 {
     double isoValue = 255.0;
     std::size_t transitionLayers = 2;
+    // Kept for cache compatibility; normal smoothing is owned by Surface Normal.
     double normalRadius = 0.002;
     double planarityRadius = 0.002;
     double planarityAngularScaleRadians = 0.2617993877991494;

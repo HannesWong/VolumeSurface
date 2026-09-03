@@ -59,7 +59,12 @@ int main()
         require(result.mesh.indices.size() % 3 == 0,
             "MLS reconstruction returned invalid triangle indices");
         require(result.crossingCellCount > 0 && result.fieldSampleCount > 0,
-            "MLS reconstruction did not sample a crossing field");
+            "MLS reconstruction did not produce source-topology projection samples");
+        require(result.projectionVertexCount == result.mesh.vertices.size(),
+            "Source-topology projection vertex count is inconsistent");
+        require(result.missingNeighborFaceCount == 0 &&
+                !result.usedSourceTopologyFallback,
+            "Reconstruction still selected a topology fallback branch");
         for (const auto& vertex : result.mesh.vertices) {
             const double length = std::sqrt(
                 static_cast<double>(vertex.normal[0]) * vertex.normal[0] +

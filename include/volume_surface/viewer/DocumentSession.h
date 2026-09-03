@@ -36,6 +36,10 @@ struct DocumentSession {
     std::size_t reconstructionCrossingCellCount = 0;
     std::size_t reconstructionFieldSampleCount = 0;
     std::size_t reconstructionSourceSupportFallbackCount = 0;
+    std::size_t reconstructionProjectionVertexCount = 0;
+    std::size_t reconstructionProjectionRejectedCount = 0;
+    std::size_t reconstructionProjectionDensityRejectedCount = 0;
+    double reconstructionProjectionMaximumDisplacement = 0.0;
 
     openvdb::FloatGrid::Ptr brushWeightGrid;
     std::filesystem::path brushWeightFieldDirectory;

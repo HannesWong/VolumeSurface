@@ -23,6 +23,8 @@ struct SurfaceReconstructionSettings
     double transitionGeometryWeight = 0.05;
     double minimumFogDensityFraction = 0.75;
     double sourceTopologyAdaptivity = 1.0;
+    std::size_t projectionIterations = 2;
+    double projectionMaximumDisplacement = 0.002;
 };
 
 struct SurfaceReconstructionTimings
@@ -47,6 +49,10 @@ struct SurfaceReconstructionResult
     std::size_t emittedFaceCount = 0;
     bool usedSourceTopologyFallback = false;
     std::size_t sourceTopologyProjectionFallbackCount = 0;
+    std::size_t projectionVertexCount = 0;
+    std::size_t projectionRejectedCount = 0;
+    std::size_t projectionDensityRejectedCount = 0;
+    double projectionMaximumDisplacement = 0.0;
     SurfaceReconstructionTimings timings;
 
     [[nodiscard]] bool empty() const noexcept { return mesh.empty(); }
@@ -56,5 +62,11 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
     const openvdb::FloatGrid& sourceGrid,
     const SurfaceTargetCache& target,
     const SurfaceReconstructionSettings& settings = {});
+
+SurfaceReconstructionResult reconstructSurfaceMLS(
+    const openvdb::FloatGrid& sourceGrid,
+    const SurfaceTargetCache& target,
+    const SurfaceReconstructionSettings& settings,
+    const std::vector<openvdb::Vec3f>* normalOverrides);
 
 } // namespace volume_surface
