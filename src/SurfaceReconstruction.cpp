@@ -267,7 +267,9 @@ std::vector<ReconstructionSample> localizeCoreSamples(
                     : Vec3d(source.normal);
                 if (!destination.normal.isFinite() ||
                     destination.normal.lengthSqr() <= 1.0e-20) {
-                    destination.normal = Vec3d(source.normal);
+                    // An invalid fitted override stays invalid; do not leak the
+                    // source gradient back into a geometry-only reconstruction.
+                    destination.normal = Vec3d(0.0);
                 }
                 destination.supportWeight = source.supportWeight;
                 destination.core =

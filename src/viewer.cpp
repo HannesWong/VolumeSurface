@@ -70,6 +70,8 @@ using CameraPickHit = volume_surface::viewer::CameraPickHit;
 using CameraPickRay = volume_surface::viewer::CameraPickRay;
 using WorkflowPanel = volume_surface::viewer::WorkflowPanel;
 using SurfaceFitPlaneRenderer = volume_surface::viewer::SurfaceFitPlaneRenderer;
+using SurfaceNormalSeed = volume_surface::viewer::SurfaceNormalSeed;
+using SurfaceNormalSeedStore = volume_surface::viewer::SurfaceNormalSeedStore;
 using ReconstructionPanelAction =
     volume_surface::viewer::ReconstructionPanelAction;
 using volume_surface::viewer::parseViewerOptions;
@@ -88,6 +90,12 @@ bool rebuildSurfaceTargetCache(
     bool tryLoadExisting = true);
 bool saveSurfaceTargetCacheToDisk(ViewerState& state);
 bool loadSurfaceTargetCacheFromDisk(ViewerState& state);
+bool loadSurfaceNormalSeedFromDisk(ViewerState& state);
+bool saveSurfaceNormalSeedToDisk(ViewerState& state);
+void processOrientationSeedPick(
+    ViewerState& state,
+    const View& view);
+bool rebuildOrientedNormalField(ViewerState& state);
 bool rebuildSurfaceNormalFit(ViewerState& state);
 bool rebuildSurfaceNormalField(ViewerState& state);
 bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& scene);
@@ -106,6 +114,14 @@ bool hasUsableNormalField(const ViewerState& state)
     return state.normalFieldReady &&
         state.surfaceTargetCache &&
         state.normalField.normals.size() == state.surfaceTargetCache->samples.size();
+}
+
+bool hasUsableOrientedNormalField(const ViewerState& state)
+{
+    return state.orientedNormalFieldReady &&
+        state.surfaceTargetCache &&
+        state.orientedNormalField.normals.size() ==
+            state.surfaceTargetCache->samples.size();
 }
 
 const char* normalFitNeighborhoodName(const ViewerState& state)
@@ -149,6 +165,10 @@ const char* normalTrendNeighborhoodName(const ViewerState& state)
 
 std::string reconstructionNormalSourceName(const ViewerState& state)
 {
+    if (hasUsableOrientedNormalField(state)) {
+        return std::string("seed_oriented_") + normalFitNeighborhoodName(state) +
+            "+surface_normal_" + normalTrendNeighborhoodName(state);
+    }
     return hasUsableNormalField(state)
         ? std::string("surface_fit_") + normalFitNeighborhoodName(state) +
             "+surface_normal_" + normalTrendNeighborhoodName(state)
@@ -260,15 +280,25 @@ public:
                 const bool pointerOverUi = isPointerOverUi(
                     event.mouseButton.x,
                     event.mouseButton.y);
-                if (mState->reconstructionPickArmed &&
-                    mState->workflowController.stage() == WorkflowStage::SurfaceFit &&
+                const bool surfaceFitPick = mState->reconstructionPickArmed &&
+                    mState->workflowController.stage() == WorkflowStage::SurfaceFit;
+                const bool orientationSeedPick = mState->orientationSeedPickArmed &&
+                    mState->workflowController.stage() == WorkflowStage::SurfaceFit;
+                if ((surfaceFitPick || orientationSeedPick) &&
                     !mState->brushControlDown &&
                     !pointerOverUi &&
                     event.mouseButton.button == 1) {
-                    mState->reconstructionPickRequested = true;
-                    mState->reconstructionPickX = event.mouseButton.x;
-                    mState->reconstructionPickY = event.mouseButton.y;
-                    mState->reconstructionPickArmed = false;
+                    if (surfaceFitPick) {
+                        mState->reconstructionPickRequested = true;
+                        mState->reconstructionPickX = event.mouseButton.x;
+                        mState->reconstructionPickY = event.mouseButton.y;
+                        mState->reconstructionPickArmed = false;
+                    } else {
+                        mState->orientationSeedPickRequested = true;
+                        mState->orientationSeedPickX = event.mouseButton.x;
+                        mState->orientationSeedPickY = event.mouseButton.y;
+                        mState->orientationSeedPickArmed = false;
+                    }
                     mCameraGrabActive = false;
                     event.type = filament::app::AppEvent::Type::TEXTINPUT;
                     event.text.text[0] = '\0';
@@ -997,6 +1027,10 @@ void setWorkflowStage(ViewerState& state, Scene& scene, WorkflowStage stage)
         state.reconstructionPickArmed = false;
         state.reconstructionPickRequested = false;
     }
+    if (stage != WorkflowStage::SurfaceFit) {
+        state.orientationSeedPickArmed = false;
+        state.orientationSeedPickRequested = false;
+    }
     state.normalFieldPreviewActive = stage == WorkflowStage::NormalField;
     state.normalFitPreviewActive = stage == WorkflowStage::SurfaceFit;
     state.normalFieldPreviewDirty = true;
@@ -1106,6 +1140,68 @@ std::filesystem::path surfaceTargetCachePathForInput(const ViewerState& state)
     return SurfaceTargetCacheRepository::pathForInput(state.input, state.gridName);
 }
 
+std::filesystem::path surfaceNormalSeedPathForInput(const ViewerState& state)
+{
+    return SurfaceNormalSeedStore::pathForInput(state.input, state.gridName);
+}
+
+bool loadSurfaceNormalSeedFromDisk(ViewerState& state)
+{
+    state.surfaceNormalSeedPath = surfaceNormalSeedPathForInput(state);
+    state.surfaceNormalSeed = {};
+    std::string error;
+    if (!SurfaceNormalSeedStore::load(
+            state.surfaceNormalSeedPath,
+            state.input,
+            state.gridName,
+            state.isoValue,
+            state.surfaceNormalSeed,
+            error)) {
+        state.surfaceNormalSeedStatus = error.empty()
+            ? "No saved orientation seed"
+            : "Seed load skipped: " + error;
+        return false;
+    }
+    state.surfaceNormalSeedStatus =
+        "Loaded " + state.surfaceNormalSeedPath.filename().string();
+    const bool orientedReady = rebuildOrientedNormalField(state);
+    if (orientedReady) {
+        state.reconstructionStatus = state.slots[1].available()
+            ? "Orientation seed updated; regenerate Result A"
+            : "Orientation seed applied; Result A will use it on generation";
+    }
+    return true;
+}
+
+bool saveSurfaceNormalSeedToDisk(ViewerState& state)
+{
+    if (!state.surfaceNormalSeed.valid) {
+        state.surfaceNormalSeedStatus = "No orientation seed is available to save";
+        return false;
+    }
+    state.surfaceNormalSeedPath = surfaceNormalSeedPathForInput(state);
+    std::string error;
+    if (!SurfaceNormalSeedStore::save(
+            state.surfaceNormalSeedPath,
+            state.surfaceNormalSeed,
+            state.input,
+            state.gridName,
+            state.isoValue,
+            error)) {
+        state.surfaceNormalSeedStatus = "Seed save failed: " + error;
+        return false;
+    }
+    state.surfaceNormalSeedStatus =
+        "Saved " + state.surfaceNormalSeedPath.filename().string();
+    const bool orientedReady = rebuildOrientedNormalField(state);
+    if (orientedReady) {
+        state.reconstructionStatus = state.slots[1].available()
+            ? "Orientation seed updated; regenerate Result A"
+            : "Orientation seed applied; Result A will use it on generation";
+    }
+    return true;
+}
+
 volume_surface::SurfaceTargetCacheMetadata surfaceTargetCacheMetadata(
     const ViewerState& state)
 {
@@ -1166,11 +1262,18 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
     state.normalFieldReady = false;
     state.normalField = {};
     state.normalFieldStatus = "Normal field has not been built for this cache";
+    state.orientedNormalFieldReady = false;
+    state.orientedNormalField = {};
+    state.normalFitAdjacencyStatistics = {};
+    state.orientedNormalAdjacencyStatistics = {};
+    state.orientedNormalStatus = "Orientation seed must be reapplied for this cache";
     state.normalFieldPreviewDirty = true;
     state.reconstructionPickArmed = false;
     state.reconstructionPickRequested = false;
     state.reconstructionPickReport = {};
     state.reconstructionPickStatus = "No reconstruction point has been picked";
+    state.orientationSeedPickArmed = false;
+    state.orientationSeedPickRequested = false;
     state.surfaceTargetCacheStatus =
         "Loaded " + state.surfaceTargetCachePath.filename().string();
     state.surfaceTargetStatus =
@@ -1179,6 +1282,7 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
         " core / " +
         std::to_string(state.surfaceTargetCache->transitionCount) +
         " transition samples";
+    loadSurfaceNormalSeedFromDisk(state);
     state.sliceDirty = true;
     return true;
 }
@@ -1220,17 +1324,25 @@ bool rebuildSurfaceTargetCache(
         state.normalFieldReady = false;
         state.normalField = {};
         state.normalFieldStatus = "Normal field has not been built for this cache";
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.normalFitAdjacencyStatistics = {};
+        state.orientedNormalAdjacencyStatistics = {};
+        state.orientedNormalStatus = "Orientation seed must be reapplied for this cache";
         state.normalFieldPreviewDirty = true;
         state.reconstructionPickArmed = false;
         state.reconstructionPickRequested = false;
         state.reconstructionPickReport = {};
         state.reconstructionPickStatus = "No reconstruction point has been picked";
+        state.orientationSeedPickArmed = false;
+        state.orientationSeedPickRequested = false;
         state.surfaceTargetStatus =
             "Surface target ready: " +
             std::to_string(state.surfaceTargetCache->coreCount) +
             " core / " +
             std::to_string(state.surfaceTargetCache->transitionCount) +
             " transition samples";
+        loadSurfaceNormalSeedFromDisk(state);
         state.sliceDirty = true;
         saveSurfaceTargetCacheToDisk(state);
         return true;
@@ -1245,11 +1357,20 @@ bool rebuildSurfaceTargetCache(
         state.normalFieldReady = false;
         state.normalField = {};
         state.normalFieldStatus = "Normal field is unavailable";
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.normalFitAdjacencyStatistics = {};
+        state.orientedNormalAdjacencyStatistics = {};
+        state.orientedNormalStatus = "Orientation seed is unavailable";
         state.normalFieldPreviewDirty = true;
         state.reconstructionPickArmed = false;
         state.reconstructionPickRequested = false;
         state.reconstructionPickReport = {};
         state.reconstructionPickStatus = "No reconstruction point has been picked";
+        state.orientationSeedPickArmed = false;
+        state.orientationSeedPickRequested = false;
+        state.surfaceNormalSeed = {};
+        state.surfaceNormalSeedStatus = "No orientation seed is available";
         state.surfaceTargetStatus = std::string("Surface target failed: ") + error.what();
         state.sliceDirty = true;
         return false;
@@ -1258,6 +1379,11 @@ bool rebuildSurfaceTargetCache(
 
 bool rebuildSurfaceNormalFit(ViewerState& state)
 {
+    state.orientedNormalFieldReady = false;
+    state.orientedNormalField = {};
+    state.normalFitAdjacencyStatistics = {};
+    state.orientedNormalAdjacencyStatistics = {};
+    state.orientedNormalStatus = "Orientation seed must be reapplied after fitting";
     if (!state.grid || !state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
         state.normalFitReady = false;
         state.normalFitField = {};
@@ -1274,6 +1400,12 @@ bool rebuildSurfaceNormalFit(ViewerState& state)
             *state.surfaceTargetCache,
             fitSettings);
         state.normalFitReady = !state.normalFitField.empty();
+        if (state.normalFitReady) {
+            state.normalFitAdjacencyStatistics =
+                volume_surface::analyzeSurfaceTargetNormalAdjacency(
+                    *state.surfaceTargetCache,
+                    state.normalFitField);
+        }
         const double elapsedMilliseconds =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
@@ -1293,6 +1425,8 @@ bool rebuildSurfaceNormalFit(ViewerState& state)
     } catch (const std::exception& error) {
         state.normalFitReady = false;
         state.normalFitField = {};
+        state.normalFitAdjacencyStatistics = {};
+        state.orientedNormalAdjacencyStatistics = {};
         state.normalFitStatus = std::string("Surface fit failed: ") + error.what();
         state.normalFieldReady = false;
         state.normalField = {};
@@ -1304,6 +1438,10 @@ bool rebuildSurfaceNormalFit(ViewerState& state)
 
 bool rebuildSurfaceNormalField(ViewerState& state)
 {
+    state.orientedNormalFieldReady = false;
+    state.orientedNormalField = {};
+    state.orientedNormalAdjacencyStatistics = {};
+    state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
     if (!state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
         state.normalFieldReady = false;
         state.normalField = {};
@@ -1347,6 +1485,80 @@ bool rebuildSurfaceNormalField(ViewerState& state)
     }
 }
 
+bool rebuildOrientedNormalField(ViewerState& state)
+{
+    state.orientedNormalFieldReady = false;
+    state.orientedNormalField = {};
+    state.orientedNormalAdjacencyStatistics = {};
+    if (!state.surfaceNormalSeed.valid || !state.surfaceTargetCache ||
+        state.surfaceTargetCache->empty()) {
+        state.orientedNormalStatus =
+            "Apply a saved orientation seed after building Surface Fit";
+        return false;
+    }
+
+    const volume_surface::SurfaceNormalField* baseField = nullptr;
+    if (hasUsableNormalField(state)) {
+        baseField = &state.normalField;
+    } else if (state.normalFitReady &&
+               state.normalFitField.normals.size() == state.surfaceTargetCache->samples.size()) {
+        baseField = &state.normalFitField;
+    }
+    if (!baseField) {
+        state.orientedNormalStatus =
+            "Build fitted or smoothed normals before applying the seed";
+        return false;
+    }
+
+    std::size_t seedSampleIndex = std::numeric_limits<std::size_t>::max();
+    for (std::size_t index = 0; index < state.surfaceTargetCache->samples.size(); ++index) {
+        if (state.surfaceTargetCache->samples[index].coordinate ==
+            state.surfaceNormalSeed.coordinate) {
+            seedSampleIndex = index;
+            break;
+        }
+    }
+    if (seedSampleIndex == std::numeric_limits<std::size_t>::max()) {
+        state.orientedNormalStatus =
+            "Saved seed coordinate is not present in the current SurfaceTarget cache";
+        return false;
+    }
+
+    try {
+        state.orientedNormalField = volume_surface::orientSurfaceTargetNormals(
+            *state.surfaceTargetCache,
+            *baseField,
+            seedSampleIndex,
+            state.surfaceNormalSeed.normal);
+        state.normalFitAdjacencyStatistics =
+            volume_surface::analyzeSurfaceTargetNormalAdjacency(
+                *state.surfaceTargetCache,
+                *baseField,
+                seedSampleIndex);
+        state.orientedNormalFieldReady = !state.orientedNormalField.empty();
+        if (state.orientedNormalFieldReady) {
+            state.orientedNormalAdjacencyStatistics =
+                volume_surface::analyzeSurfaceTargetNormalAdjacency(
+                    *state.surfaceTargetCache,
+                    state.orientedNormalField,
+                    seedSampleIndex);
+        }
+        state.orientedNormalStatus = state.orientedNormalFieldReady
+            ? "Seed orientation applied: " +
+                std::to_string(state.orientedNormalField.smoothedCoreCount) +
+                " core / " +
+                std::to_string(state.orientedNormalField.smoothedTransitionCount) +
+                " transition samples"
+            : "Seed orientation produced no valid normals";
+        state.normalFieldPreviewDirty = true;
+        return state.orientedNormalFieldReady;
+    } catch (const std::exception& error) {
+        state.orientedNormalStatus =
+            std::string("Seed orientation failed: ") + error.what();
+        return false;
+    }
+}
+
 void rebuildSurfaceTargetPreview(ViewerState& state, Engine& engine, Scene& scene)
 {
     volume_surface::SurfaceTargetPreview::Inputs inputs;
@@ -1365,12 +1577,17 @@ void rebuildSurfaceTargetPreview(ViewerState& state, Engine& engine, Scene& scen
         if (state.normalFitPreviewActive &&
             state.normalFitReady &&
             state.normalFitField.normals.size() == state.surfaceTargetCache->samples.size()) {
-            inputs.normalOverrides = &state.normalFitField.normals;
+            inputs.normalOverrides = hasUsableOrientedNormalField(state)
+                ? &state.orientedNormalField.normals
+                : &state.normalFitField.normals;
         } else if (state.normalFieldPreviewActive &&
-                   state.normalFieldPreviewSmoothed &&
-                   state.normalFieldReady &&
-                   state.normalField.normals.size() == state.surfaceTargetCache->samples.size()) {
-            inputs.normalOverrides = &state.normalField.normals;
+                   state.normalFieldPreviewSmoothed) {
+            if (hasUsableOrientedNormalField(state)) {
+                inputs.normalOverrides = &state.orientedNormalField.normals;
+            } else if (state.normalFieldReady &&
+                       state.normalField.normals.size() == state.surfaceTargetCache->samples.size()) {
+                inputs.normalOverrides = &state.normalField.normals;
+            }
         }
     }
     state.surfaceTargetPreview.rebuild(engine, scene, inputs);
@@ -1473,9 +1690,11 @@ bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& sce
     state.reconstructionSettings.isoValue = state.isoValue;
     const auto start = std::chrono::steady_clock::now();
     try {
-        const auto* normalOverrides = hasUsableNormalField(state)
-            ? &state.normalField.normals
-            : nullptr;
+        const auto* normalOverrides = hasUsableOrientedNormalField(state)
+            ? &state.orientedNormalField.normals
+            : hasUsableNormalField(state)
+                ? &state.normalField.normals
+                : nullptr;
         auto result = volume_surface::reconstructSurfaceMLS(
             *state.grid,
             *state.surfaceTargetCache,
@@ -1623,8 +1842,14 @@ void rebuildPickedSurfaceFitPlane(
     inputs.normalWorld = report.targetSampleFound
         ? openvdb::Vec3d(report.targetSample.normal)
         : report.vdb.normal;
-    inputs.normalWorld = openvdb::Vec3d(
-        state.normalFitField.normals[report.targetSampleIndex]);
+    const auto& displayedNormals = hasUsableOrientedNormalField(state)
+        ? state.orientedNormalField.normals
+        : state.normalFitField.normals;
+    if (report.targetSampleIndex >= displayedNormals.size()) {
+        state.surfaceFitPlaneRenderer.rebuild(engine, scene, {});
+        return;
+    }
+    inputs.normalWorld = openvdb::Vec3d(displayedNormals[report.targetSampleIndex]);
     inputs.referenceCenter = openvdb::Vec3d{
         state.referenceCenter.x,
         state.referenceCenter.y,
@@ -1682,6 +1907,7 @@ void processSurfaceFitPick(
     report.slotIndex = hit.slotIndex;
     report.triangleIndex = hit.triangleIndex;
     report.barycentric = hit.barycentric;
+    report.rayDirection = ray.direction;
     report.scenePosition = hit.scenePosition;
     report.meshWorldPosition = state.context.coordinates.toWorld(
         filament::math::float3{
@@ -1704,9 +1930,12 @@ void processSurfaceFitPick(
         *state.grid,
         targetPosition,
         report);
-    if (report.targetSampleFound && hasUsableNormalField(state)) {
-        report.smoothedNormal = openvdb::Vec3d(
-            state.normalField.normals[report.targetSampleIndex]);
+    if (report.targetSampleFound &&
+        (hasUsableOrientedNormalField(state) || hasUsableNormalField(state))) {
+        const auto& normals = hasUsableOrientedNormalField(state)
+            ? state.orientedNormalField.normals
+            : state.normalField.normals;
+        report.smoothedNormal = openvdb::Vec3d(normals[report.targetSampleIndex]);
         report.smoothedNormalFound = report.smoothedNormal.lengthSqr() > 1.0e-20;
     }
     state.reconstructionPickStatus = report.vdb.converged
@@ -1714,6 +1943,89 @@ void processSurfaceFitPick(
         : "Picked mesh; VDB projection did not converge, original point retained";
     rebuildPickedSurfaceFitPlane(state, engine, scene);
     applyWorkflowPresentation(state, scene);
+}
+
+void processOrientationSeedPick(
+    ViewerState& state,
+    const View& view)
+{
+    if (!state.orientationSeedPickRequested) {
+        return;
+    }
+    state.orientationSeedPickRequested = false;
+    state.orientationSeedPickArmed = false;
+    if (state.workflowController.stage() != WorkflowStage::SurfaceFit ||
+        !state.grid || !state.surfaceTargetCache ||
+        state.surfaceTargetCache->empty()) {
+        state.surfaceNormalSeedStatus =
+            "Seed pick requires a SurfaceTarget cache";
+        return;
+    }
+
+    CameraPickRay ray;
+    if (!buildCameraPickRay(
+            view,
+            state.orientationSeedPickX,
+            state.orientationSeedPickY,
+            ray)) {
+        state.surfaceNormalSeedStatus = "Unable to build the seed pick ray";
+        return;
+    }
+    std::array<bool, 4> visibleSlots{};
+    for (std::size_t index = 0; index < visibleSlots.size(); ++index) {
+        visibleSlots[index] = state.slots[index].visible;
+    }
+    const CameraPickHit hit = state.cameraPickController.pick(ray, visibleSlots);
+    if (!hit.hit) {
+        state.surfaceNormalSeedStatus = "No visible mesh was hit for the seed";
+        return;
+    }
+
+    const openvdb::Vec3d meshWorldPosition = state.context.coordinates.toWorld(
+        filament::math::float3{
+            static_cast<float>(hit.scenePosition.x()),
+            static_cast<float>(hit.scenePosition.y()),
+            static_cast<float>(hit.scenePosition.z())});
+    volume_surface::VdbSurfaceProbeSettings probeSettings;
+    probeSettings.isoValue = state.isoValue;
+    const auto vdbSurface = volume_surface::projectVdbSurface(
+        *state.grid,
+        meshWorldPosition,
+        probeSettings);
+    const openvdb::Vec3d targetPosition = vdbSurface.valid
+        ? vdbSurface.worldPosition
+        : meshWorldPosition;
+    volume_surface::viewer::ReconstructionPickReport targetReport;
+    if (!findNearestSurfaceTargetSample(
+            *state.surfaceTargetCache,
+            *state.grid,
+            targetPosition,
+            targetReport)) {
+        state.surfaceNormalSeedStatus =
+            "The picked point is not near a SurfaceTarget sample";
+        return;
+    }
+
+    const double rayLength = ray.direction.length();
+    const openvdb::Vec3d outward = rayLength > 1.0e-12 &&
+            std::isfinite(rayLength)
+        ? -ray.direction / rayLength
+        : openvdb::Vec3d(0.0);
+    if (outward.lengthSqr() <= 1.0e-20) {
+        state.surfaceNormalSeedStatus = "The seed pick ray has no valid direction";
+        return;
+    }
+    state.surfaceNormalSeed = {};
+    state.surfaceNormalSeed.valid = true;
+    state.surfaceNormalSeed.coordinate = targetReport.targetSample.coordinate;
+    state.surfaceNormalSeed.worldPosition =
+        openvdb::Vec3d(targetReport.targetSample.worldPosition);
+    state.surfaceNormalSeed.normal = outward;
+    state.surfaceNormalSeed.rayDirection = ray.direction;
+    if (saveSurfaceNormalSeedToDisk(state)) {
+        state.surfaceNormalSeedStatus =
+            "Seed selected from outside ray and saved automatically";
+    }
 }
 
 void drawSlotControls(ViewerState& state, Engine& engine, Scene& scene, std::size_t index)
@@ -2080,7 +2392,7 @@ void drawSurfaceTargetWindow(ViewerState& state, Engine& engine, Scene& scene)
 void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
 {
     ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(390.0f, 760.0f), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(390.0f, 860.0f), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(1.0f);
     ImGui::Begin("Surface Fit / Normal Seed");
     state.mouseOverUi |= ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
@@ -2112,6 +2424,9 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
         state.normalFitField = {};
         state.normalFieldReady = false;
         state.normalField = {};
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.orientedNormalStatus = "Orientation seed must be reapplied after fitting";
         state.normalFitStatus = "Surface fit settings changed; build the selected mode";
         state.normalFieldStatus = "Normal field requires the updated fitted seed field";
         state.normalFieldPreviewDirty = true;
@@ -2128,6 +2443,9 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
         state.normalFitField = {};
         state.normalFieldReady = false;
         state.normalField = {};
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.orientedNormalStatus = "Orientation seed must be reapplied after fitting";
         state.normalFitStatus = "Surface fit settings changed; build the selected mode";
         state.normalFieldStatus = "Normal field requires the updated fitted seed field";
         state.normalFieldPreviewDirty = true;
@@ -2231,8 +2549,98 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
         }
     }
 
+    ImGui::Separator();
+    ImGui::TextUnformatted("Orientation seed");
+    ImGui::TextWrapped(
+        "Pick from outside the model. The seed normal defaults to the opposite of the camera ray.");
+    if (ImGui::Button(
+            state.orientationSeedPickArmed
+                ? "Click an external surface point"
+                : "Pick orientation seed")) {
+        state.orientationSeedPickArmed = true;
+        state.reconstructionPickArmed = false;
+        state.surfaceNormalSeedStatus =
+            "Click a visible mesh from outside the model";
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!state.surfaceNormalSeed.valid);
+    if (ImGui::Button("Save seed")) {
+        saveSurfaceNormalSeedToDisk(state);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Load seed")) {
+        loadSurfaceNormalSeedFromDisk(state);
+    }
+    ImGui::TextWrapped("Seed file: %s",
+        state.surfaceNormalSeedPath.empty()
+            ? "not assigned"
+            : state.surfaceNormalSeedPath.string().c_str());
+    ImGui::TextWrapped("Seed status: %s", state.surfaceNormalSeedStatus.c_str());
+    if (state.surfaceNormalSeed.valid) {
+        ImGui::Text(
+            "Seed index: (%d, %d, %d)",
+            state.surfaceNormalSeed.coordinate.x(),
+            state.surfaceNormalSeed.coordinate.y(),
+            state.surfaceNormalSeed.coordinate.z());
+        ImGui::Text(
+            "Seed normal: %.3f, %.3f, %.3f",
+            state.surfaceNormalSeed.normal.x(),
+            state.surfaceNormalSeed.normal.y(),
+            state.surfaceNormalSeed.normal.z());
+        ImGui::TextWrapped("Orientation: %s", state.orientedNormalStatus.c_str());
+        if (hasUsableOrientedNormalField(state) && state.surfaceTargetCache) {
+            for (std::size_t index = 0;
+                 index < state.surfaceTargetCache->samples.size();
+                 ++index) {
+                if (state.surfaceTargetCache->samples[index].coordinate !=
+                    state.surfaceNormalSeed.coordinate) {
+                    continue;
+                }
+                const openvdb::Vec3d appliedNormal(
+                    state.orientedNormalField.normals[index]);
+                const openvdb::Vec3d requestedNormal =
+                    state.surfaceNormalSeed.normal.unit();
+                ImGui::Text(
+                    "Applied at seed: %.3f, %.3f, %.3f (dot %.3f)",
+                    appliedNormal.x(),
+                    appliedNormal.y(),
+                    appliedNormal.z(),
+                    appliedNormal.dot(requestedNormal));
+                break;
+            }
+        }
+        const auto& beforeStats = state.normalFitAdjacencyStatistics;
+        const auto& afterStats = state.orientedNormalAdjacencyStatistics;
+        if (afterStats.adjacencyEdgeCount > 0) {
+            ImGui::Text(
+                "Valid normals: %zu core / %zu transition",
+                afterStats.validCoreSampleCount,
+                afterStats.validTransitionSampleCount);
+            ImGui::Text(
+                "Core adjacency edges: %zu | opposing: %zu -> %zu",
+                afterStats.adjacencyEdgeCount,
+                beforeStats.opposingEdgeCount,
+                afterStats.opposingEdgeCount);
+            ImGui::Text(
+                "Weak edges: %zu | components: %zu | unseeded samples: %zu",
+                afterStats.weakEdgeCount,
+                afterStats.connectedComponentCount,
+                afterStats.unseededComponentSampleCount);
+            ImGui::Text(
+                "Transition-linked edges: %zu | opposing: %zu",
+                afterStats.transitionAdjacencyEdgeCount,
+                afterStats.transitionOpposingEdgeCount);
+            ImGui::Text(
+                "Signed dot mean/min: %.3f / %.3f",
+                afterStats.meanSignedAlignment,
+                afterStats.minimumSignedAlignment);
+        }
+    }
+
     if (ImGui::Button("Build / update fitted normals")) {
         rebuildSurfaceNormalFit(state);
+        rebuildOrientedNormalField(state);
         rebuildPickedSurfaceFitPlane(state, engine, scene);
         state.normalFieldPreviewDirty = true;
     }
@@ -2253,8 +2661,11 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
         state.normalFitField.smoothedTransitionCount);
     ImGui::TextWrapped(
         "This stage produces the seed field consumed by Surface Normal.");
+    ImGui::TextWrapped(
+        "Fitted normals use only sample positions and index connectivity; their sign is not corrected from the source normal or VDB values.");
     ImGui::TextWrapped("Status: %s", state.status.c_str());
     if (state.normalFieldPreviewDirty) {
+        rebuildPickedSurfaceFitPlane(state, engine, scene);
         rebuildSurfaceTargetPreview(state, engine, scene);
     }
     ImGui::End();
@@ -2271,6 +2682,8 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
         "Optionally average the fitted surface normals without moving the SurfaceTarget samples.");
     ImGui::TextWrapped(
         "None keeps the Surface Fit / Normal Seed result unchanged.");
+    ImGui::TextWrapped(
+        "A saved orientation seed is applied to a separate oriented field for this stage and reconstruction.");
     ImGui::Separator();
 
     auto& settings = state.normalSmoothingSettings;
@@ -2295,6 +2708,9 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
                 ? volume_surface::SurfaceNormalNeighborhood::Grid3x3
                 : volume_surface::SurfaceNormalNeighborhood::None;
         state.normalFieldReady = false;
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
         state.normalFieldPreviewDirty = true;
         state.normalFieldStatus = "Normal field settings changed; build the selected mode";
     }
@@ -2303,6 +2719,9 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
     if (ImGui::SliderFloat("Trend strength", &strength, 0.0f, 1.0f, "%.2f")) {
         settings.strength = std::clamp(static_cast<double>(strength), 0.0, 1.0);
         state.normalFieldReady = false;
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
         state.normalFieldPreviewDirty = true;
         state.normalFieldStatus = "Normal field settings changed; build the selected mode";
     }
@@ -2313,6 +2732,9 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
     if (ImGui::SliderInt("Robust iterations", &robustIterations, 1, 5)) {
         settings.robustIterations = static_cast<std::size_t>(robustIterations);
         state.normalFieldReady = false;
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
         state.normalFieldPreviewDirty = true;
         state.normalFieldStatus = "Normal field settings changed; build the selected mode";
     }
@@ -2323,10 +2745,14 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
 
     if (ImGui::Button("Build / update normal field")) {
         rebuildSurfaceNormalField(state);
+        rebuildOrientedNormalField(state);
         state.normalFieldPreviewDirty = true;
     }
     ImGui::SameLine();
     ImGui::TextWrapped("%s", state.normalFieldStatus.c_str());
+    if (state.surfaceNormalSeed.valid) {
+        ImGui::TextWrapped("Seed orientation: %s", state.orientedNormalStatus.c_str());
+    }
     bool previewChanged = ImGui::Checkbox(
         "Preview with smoothed normals",
         &state.normalFieldPreviewSmoothed);
@@ -2376,6 +2802,7 @@ void drawUi(
 {
     ViewerState& state = *statePointer;
     processSurfaceFitPick(state, engine, scene, view);
+    processOrientationSeedPick(state, view);
     if (state.workflowController.stage() == WorkflowStage::WeightPainting) {
         state.brushInteractionController.processPendingCenter(state, engine, scene);
         state.brushInteractionController.processPendingStroke(state, engine, scene);

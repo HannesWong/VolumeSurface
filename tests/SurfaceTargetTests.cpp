@@ -208,12 +208,10 @@ void testConnectedNormalTrend()
         ++coreIndex;
     }
     require(coreIndex < cache.samples.size(), "normal trend core index is invalid");
-    require(openvdb::Vec3d(small.normals[coreIndex]).dot(
-                openvdb::Vec3d(core->normal)) > 0.0,
-        "3x3 normal trend reversed the seed orientation");
-    require(openvdb::Vec3d(large.normals[coreIndex]).dot(
-                openvdb::Vec3d(core->normal)) > 0.0,
-        "5x5 normal trend reversed the seed orientation");
+    require(openvdb::Vec3d(small.normals[coreIndex]).lengthSqr() > 0.99,
+        "3x3 normal trend did not produce a unit normal axis");
+    require(openvdb::Vec3d(large.normals[coreIndex]).lengthSqr() > 0.99,
+        "5x5 normal trend did not produce a unit normal axis");
 
     volume_surface::SurfaceNormalFitSettings fitSettings;
     fitSettings.neighborhood = volume_surface::SurfaceFitNeighborhood::Grid9x9;
@@ -223,16 +221,27 @@ void testConnectedNormalTrend()
     require(fitted.normals.size() == cache.samples.size() &&
             fitted.smoothedCoreCount > 0,
         "9x9 surface fit produced no fitted core normals");
-    require(openvdb::Vec3d(fitted.normals[coreIndex]).dot(
-                openvdb::Vec3d(core->normal)) > 0.0,
-        "9x9 surface fit reversed the seed orientation");
-    const auto gridOriented = volume_surface::fitSurfaceTargetNormals(
+    require(openvdb::Vec3d(fitted.normals[coreIndex]).lengthSqr() > 0.99,
+        "9x9 surface fit did not produce a unit normal axis");
+    auto geometryOnlyCache = cache;
+    for (auto& sample : geometryOnlyCache.samples) {
+        sample.normal = openvdb::Vec3f(0.0f);
+    }
+    const auto fittedWithoutSourceNormals = volume_surface::fitSurfaceTargetNormals(
+        geometryOnlyCache,
+        fitSettings);
+    require(fittedWithoutSourceNormals.normals.size() == cache.samples.size() &&
+            fittedWithoutSourceNormals.smoothedCoreCount > 0,
+        "surface fit still depended on source normal values");
+    require(std::abs(openvdb::Vec3d(fittedWithoutSourceNormals.normals[coreIndex]).dot(
+        openvdb::Vec3d(fitted.normals[coreIndex]))) > 0.99,
+        "geometry-only fit changed the fitted normal axis");
+    const auto gridOverload = volume_surface::fitSurfaceTargetNormals(
         *grid,
         cache,
         fitSettings);
-    require(openvdb::Vec3d(gridOriented.normals[coreIndex]).dot(
-                openvdb::Vec3d(core->normal)) > 0.0,
-        "grid-oriented 9x9 surface fit reversed the surface direction");
+    require(gridOverload.normals[coreIndex].lengthSqr() > 0.99f,
+        "grid overload did not produce a unit normal axis");
     normalSettings.neighborhood = volume_surface::SurfaceNormalNeighborhood::None;
     const auto unsmoothed = volume_surface::smoothSurfaceTargetNormals(
         cache,
@@ -243,6 +252,51 @@ void testConnectedNormalTrend()
             (openvdb::Vec3d(unsmoothed.normals[coreIndex]) -
                 openvdb::Vec3d(fitted.normals[coreIndex])).lengthSqr() < 1.0e-12,
         "None normal trend changed the fitted seed field");
+
+    const openvdb::Vec3d fittedAxis =
+        openvdb::Vec3d(fitted.normals[coreIndex]).unit();
+    const auto oriented = volume_surface::orientSurfaceTargetNormals(
+        cache,
+        fitted,
+        coreIndex,
+        -fittedAxis);
+    require(oriented.normals.size() == fitted.normals.size() &&
+            oriented.smoothedCoreCount > 0,
+        "orientation seed produced no oriented core normals");
+    require(openvdb::Vec3d(oriented.normals[coreIndex]).dot(-fittedAxis) > 0.99,
+        "orientation seed did not set the selected seed direction");
+    std::size_t firstTransitionIndex = 0;
+    std::size_t secondTransitionIndex = 0;
+    bool foundFirstTransition = false;
+    bool foundSecondTransition = false;
+    for (std::size_t index = 0; index < cache.samples.size(); ++index) {
+        if (cache.samples[index].coordinate == openvdb::Coord(1, 0, 0)) {
+            firstTransitionIndex = index;
+            foundFirstTransition = true;
+        } else if (cache.samples[index].coordinate == openvdb::Coord(2, 0, 0)) {
+            secondTransitionIndex = index;
+            foundSecondTransition = true;
+        }
+    }
+    require(foundFirstTransition && foundSecondTransition,
+        "orientation transition samples are missing");
+    require(openvdb::Vec3d(oriented.normals[firstTransitionIndex]).dot(
+                openvdb::Vec3d(oriented.normals[coreIndex])) > 0.99 &&
+            openvdb::Vec3d(oriented.normals[secondTransitionIndex]).dot(
+                openvdb::Vec3d(oriented.normals[firstTransitionIndex])) > 0.99,
+        "transition orientation did not propagate through multiple layers");
+    const auto orientationStats =
+        volume_surface::analyzeSurfaceTargetNormalAdjacency(
+            cache,
+            oriented,
+            coreIndex);
+    require(orientationStats.validCoreSampleCount > 0 &&
+            orientationStats.adjacencyEdgeCount > 0 &&
+            orientationStats.connectedComponentCount > 0,
+        "normal adjacency analysis did not find the connected core surface");
+    require(orientationStats.seededComponentSampleCount > 0 &&
+            orientationStats.unseededComponentSampleCount == 0,
+        "normal adjacency analysis misclassified the seeded component");
 }
 
 void testVdbSurfaceProbe()

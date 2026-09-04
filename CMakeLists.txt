@@ -104,6 +104,19 @@ target_link_libraries(vdb_surface_reconstruction_info
 
 volume_surface_copy_openvdb_runtime(vdb_surface_reconstruction_info)
 
+add_executable(surface_normal_diagnostics_info
+    src/normal_diagnostics_info.cpp
+    src/SurfaceTargetCacheRepository.cpp
+    src/SurfaceNormalSeedStore.cpp
+)
+
+target_link_libraries(surface_normal_diagnostics_info
+    PRIVATE
+        volume_surface_mesh
+)
+
+volume_surface_copy_openvdb_runtime(surface_normal_diagnostics_info)
+
 if(VOLUME_SURFACE_BUILD_VIEWER)
     include(FilamentLocal)
 
@@ -221,6 +234,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         src/SliceRenderer.cpp
         src/SurfaceTargetPreview.cpp
         src/SurfaceFitPlaneRenderer.cpp
+        src/SurfaceNormalSeedStore.cpp
         src/SurfaceTargetCacheRepository.cpp
         src/WorkflowController.cpp
         src/WorkflowPanel.cpp

@@ -32,6 +32,7 @@
 #include "volume_surface/viewer/ReconstructionPick.h"
 #include "volume_surface/viewer/SliceRenderer.h"
 #include "volume_surface/viewer/SurfaceFitPlaneRenderer.h"
+#include "volume_surface/viewer/SurfaceNormalSeedStore.h"
 #include "volume_surface/viewer/ViewerContext.h"
 #include "volume_surface/viewer/WorkflowController.h"
 #include "volume_surface/viewer/WorkflowPanel.h"
@@ -68,6 +69,11 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     bool normalFieldPreviewActive = false;
     bool normalFieldPreviewDirty = false;
     std::string normalFieldStatus = "Normal field has not been built";
+    volume_surface::SurfaceNormalField orientedNormalField;
+    bool orientedNormalFieldReady = false;
+    std::string orientedNormalStatus = "Orientation seed has not been applied";
+    volume_surface::SurfaceNormalAdjacencyStatistics normalFitAdjacencyStatistics;
+    volume_surface::SurfaceNormalAdjacencyStatistics orientedNormalAdjacencyStatistics;
     float wheelZoomMultiplier = 12.0f;
     float wheelHitDistanceRatio = 0.15f;
     float wheelMinimumDistanceMillimeters = 1.0f;
@@ -96,6 +102,13 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     volume_surface::SurfaceBrushResult brushResult;
     volume_surface::SurfaceTargetPreview surfaceTargetPreview;
     SurfaceFitPlaneRenderer surfaceFitPlaneRenderer;
+    SurfaceNormalSeed surfaceNormalSeed;
+    std::filesystem::path surfaceNormalSeedPath;
+    std::string surfaceNormalSeedStatus = "No saved orientation seed";
+    bool orientationSeedPickArmed = false;
+    bool orientationSeedPickRequested = false;
+    int orientationSeedPickX = 0;
+    int orientationSeedPickY = 0;
     std::string surfaceTargetStatus = "Surface target pending";
     std::string surfaceTargetCacheStatus = "No saved surface target cache";
     std::string reconstructionStatus = "Result A has not been generated";

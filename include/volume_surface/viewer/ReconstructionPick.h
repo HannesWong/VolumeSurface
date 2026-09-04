@@ -19,6 +19,7 @@ struct ReconstructionPickReport
     std::size_t slotIndex = std::numeric_limits<std::size_t>::max();
     std::size_t triangleIndex = std::numeric_limits<std::size_t>::max();
     std::array<double, 3> barycentric{};
+    openvdb::Vec3d rayDirection{};
     openvdb::Vec3d scenePosition{};
     openvdb::Vec3d meshWorldPosition{};
     volume_surface::VdbSurfaceProbeResult vdb;

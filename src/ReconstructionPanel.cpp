@@ -99,6 +99,9 @@ ReconstructionPanelAction ReconstructionPanel::draw(ViewerState& state) const
     const bool normalFieldReady = state.normalFieldReady &&
         state.surfaceTargetCache &&
         state.normalField.normals.size() == state.surfaceTargetCache->samples.size();
+    const bool orientedNormalFieldReady = state.orientedNormalFieldReady &&
+        state.surfaceTargetCache &&
+        state.orientedNormalField.normals.size() == state.surfaceTargetCache->samples.size();
     const char* fitSource = state.normalFitSettings.neighborhood ==
             volume_surface::SurfaceFitNeighborhood::Grid9x9
         ? "9 x 9"
@@ -113,7 +116,10 @@ ReconstructionPanelAction ReconstructionPanel::draw(ViewerState& state) const
                 volume_surface::SurfaceNormalNeighborhood::Grid3x3
             ? "3 x 3"
             : "none";
-    const std::string normalSource = normalFieldReady
+    const std::string normalSource = orientedNormalFieldReady
+        ? "seed-oriented surface fit (" + std::string(fitSource) + ") + trend (" +
+            std::string(trendSource) + ")"
+        : normalFieldReady
         ? "surface fit (" + std::string(fitSource) + ") + trend (" +
             std::string(trendSource) + ")"
         : "raw SurfaceTarget normals";

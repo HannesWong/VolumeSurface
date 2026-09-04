@@ -86,7 +86,9 @@ std::string formatReconstructionPickReportJsonl(
            << report.barycentric[0] << ','
            << report.barycentric[1] << ','
            << report.barycentric[2] << "]"
-           << ",\"scene_position\":";
+           << ",\"ray_direction\":";
+    appendVec3(stream, report.rayDirection);
+    stream << ",\"scene_position\":";
     appendVec3(stream, report.scenePosition);
     stream << ",\"mesh_world_mm\":";
     appendVec3Millimeters(stream, report.meshWorldPosition);
