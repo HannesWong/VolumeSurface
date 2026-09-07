@@ -1,0 +1,87 @@
+material {
+    name : SurfaceFitExpansionDebugPoints,
+    requires : [
+        custom0,
+        color
+    ],
+    shadingModel : lit,
+    blending : masked,
+    culling : none,
+    depthWrite : false,
+    depthCulling : false,
+    customSurfaceShading : true,
+    parameters : [
+        {
+            type : float,
+            name : POINT_RADIUS
+        },
+        {
+            type : bool,
+            name : NORMAL_CULL
+        },
+        {
+            type : float,
+            name : AMBIENT_LEVEL
+        },
+        {
+            type : float,
+            name : SPECULAR_STRENGTH
+        },
+        {
+            type : float,
+            name : SHININESS
+        }
+    ]
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        vec4 viewPosition = getViewFromWorldMatrix() * material.worldPosition;
+        float focalPixels = 0.5 * getResolution().y *
+            getClipFromViewMatrix()[1][1];
+        gl_PointSize = max(
+            1.0,
+            2.0 * materialParams.POINT_RADIUS * focalPixels /
+                max(abs(viewPosition.z), 1.0e-4));
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+
+        vec2 sprite = gl_PointCoord * 2.0 - 1.0;
+        if (dot(sprite, sprite) > 1.0) {
+            material.baseColor = vec4(0.0);
+            return;
+        }
+
+        vec3 normal = getWorldNormalVector();
+        vec3 viewDirection = getWorldViewVector();
+        if (materialParams.NORMAL_CULL && dot(normal, viewDirection) <= 0.0) {
+            material.baseColor = vec4(0.0);
+            return;
+        }
+
+        material.baseColor = getColor();
+        material.metallic = 0.0;
+        material.roughness = 0.38;
+    }
+
+    vec3 surfaceShading(
+        const MaterialInputs materialInputs,
+        const ShadingData shadingData,
+        const LightData lightData
+    ) {
+        vec3 viewDirection = getWorldViewVector();
+        vec3 halfVector = normalize(lightData.l + viewDirection);
+        float diffuse = max(lightData.NdotL, 0.0);
+        float specular = pow(
+            max(dot(getWorldNormalVector(), halfVector), 0.0),
+            materialParams.SHININESS) * materialParams.SPECULAR_STRENGTH;
+        vec3 lightColor = lightData.colorIntensity.rgb * lightData.colorIntensity.w;
+        return shadingData.diffuseColor *
+            (materialParams.AMBIENT_LEVEL + diffuse) * lightColor +
+            specular * lightColor;
+    }
+}

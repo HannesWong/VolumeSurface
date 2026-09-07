@@ -92,6 +92,7 @@ private:
 
     [[nodiscard]] bool intersectPanPlane(
         const CameraPickRay& ray,
+        const openvdb::Vec3d& rayOrigin,
         openvdb::Vec3d& point) const noexcept;
 
     SurfaceAwareCameraPose mPose;

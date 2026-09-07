@@ -422,15 +422,14 @@ struct SurfaceTargetPreview::Impl {
                 continue;
             }
             instance->setParameter("POINT_RADIUS", radius);
-            instance->setParameter("NORMAL_CULL", settings.frontFacingOnly);
+            instance->setParameter("NORMAL_CULL", false);
             instance->setParameter("AMBIENT_LEVEL", 0.12f);
             instance->setParameter("SPECULAR_STRENGTH", 0.22f);
             instance->setParameter("SHININESS", 24.0f);
         }
         if (normals.materialInstance) {
-            normals.materialInstance->setParameter(
-                "NORMAL_CULL",
-                settings.frontFacingOnly);
+            // Normal diagnostics must remain visible from both sides.
+            normals.materialInstance->setParameter("NORMAL_CULL", false);
         }
         if (bvh.materialInstance) {
             bvh.materialInstance->setParameter("NORMAL_CULL", false);
@@ -530,16 +529,18 @@ void SurfaceTargetPreview::rebuild(
                 transitionVertices.push_back(vertex);
                 ++mImpl->statistics.transitionPointCount;
             }
-            normalVertices.push_back({
-                position,
-                normalBaseColor,
-                vertex.normal});
-            const float3 endpoint = position + float3{
-                static_cast<float>(normal.x()),
-                static_cast<float>(normal.y()),
-                static_cast<float>(normal.z())} *
-                (4.0f * 0.001f * inputs.displayScale);
-            normalVertices.push_back({endpoint, normalTipColor, vertex.normal});
+            if (sample.kind == SurfaceTargetSampleKind::Core) {
+                normalVertices.push_back({
+                    position,
+                    normalBaseColor,
+                    vertex.normal});
+                const float3 endpoint = position + float3{
+                    static_cast<float>(normal.x()),
+                    static_cast<float>(normal.y()),
+                    static_cast<float>(normal.z())} *
+                    (4.0f * 0.001f * inputs.displayScale);
+                normalVertices.push_back({endpoint, normalTipColor, vertex.normal});
+            }
         }
     } else {
         const auto& mesh = *inputs.fallbackMesh;

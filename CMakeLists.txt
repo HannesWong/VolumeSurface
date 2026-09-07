@@ -131,8 +131,14 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
     set(_brush_cursor_package "${_viewer_material_dir}/brushCursor.filamat")
     set(_surface_target_points_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceTargetPoints.mat")
     set(_surface_target_points_package "${_viewer_material_dir}/surfaceTargetPoints.filamat")
+    set(_surface_target_point_pick_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceTargetPointPick.mat")
+    set(_surface_target_point_pick_package "${_viewer_material_dir}/surfaceTargetPointPick.filamat")
     set(_surface_target_debug_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceTargetDebug.mat")
     set(_surface_target_debug_package "${_viewer_material_dir}/surfaceTargetDebug.filamat")
+    set(_surface_fit_expansion_points_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitExpansionDebugPoints.mat")
+    set(_surface_fit_expansion_points_package
+        "${_viewer_material_dir}/surfaceFitExpansionDebugPoints.filamat")
     set(_surface_fit_plane_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitPlane.mat")
     set(_surface_fit_plane_package "${_viewer_material_dir}/surfaceFitPlane.filamat")
     add_custom_command(
@@ -166,6 +172,16 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         VERBATIM
     )
     add_custom_command(
+        OUTPUT "${_surface_target_point_pick_package}"
+        COMMAND matc ${MATC_BASE_FLAGS}
+            -o "${_surface_target_point_pick_package}"
+            "${_surface_target_point_pick_source}"
+        MAIN_DEPENDENCY "${_surface_target_point_pick_source}"
+        DEPENDS matc
+        COMMENT "Compiling SurfaceTarget point pick material"
+        VERBATIM
+    )
+    add_custom_command(
         OUTPUT "${_surface_target_debug_package}"
         COMMAND matc ${MATC_BASE_FLAGS}
             -o "${_surface_target_debug_package}"
@@ -185,6 +201,16 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         COMMENT "Compiling SurfaceFit plane material"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${_surface_fit_expansion_points_package}"
+        COMMAND matc ${MATC_BASE_FLAGS}
+            -o "${_surface_fit_expansion_points_package}"
+            "${_surface_fit_expansion_points_source}"
+        MAIN_DEPENDENCY "${_surface_fit_expansion_points_source}"
+        DEPENDS matc
+        COMMENT "Compiling SurfaceFit expansion selected point material"
+        VERBATIM
+    )
 
     get_resgen_vars("${_viewer_resource_dir}" volume_surface_viewer_resources)
     add_custom_command(
@@ -193,13 +219,17 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             "${_brush_heatmap_package}"
             "${_brush_cursor_package}"
             "${_surface_target_points_package}"
+            "${_surface_target_point_pick_package}"
             "${_surface_target_debug_package}"
+            "${_surface_fit_expansion_points_package}"
             "${_surface_fit_plane_package}"
         DEPENDS resgen
             "${_brush_heatmap_package}"
             "${_brush_cursor_package}"
             "${_surface_target_points_package}"
+            "${_surface_target_point_pick_package}"
             "${_surface_target_debug_package}"
+            "${_surface_fit_expansion_points_package}"
             "${_surface_fit_plane_package}"
         COMMENT "Embedding viewer materials"
         VERBATIM
@@ -233,7 +263,9 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         src/ReconstructionPick.cpp
         src/SliceRenderer.cpp
         src/SurfaceTargetPreview.cpp
+        src/SurfaceTargetPointPicker.cpp
         src/SurfaceFitPlaneRenderer.cpp
+        src/SurfaceFitExpansionDebugRenderer.cpp
         src/SurfaceNormalSeedStore.cpp
         src/SurfaceTargetCacheRepository.cpp
         src/WorkflowController.cpp
@@ -255,6 +287,26 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             NOMINMAX
     )
 
+    set(_viewer_cjk_font "")
+    if(WIN32 AND EXISTS "C:/Windows/Fonts/simhei.ttf")
+        set(_viewer_cjk_font "C:/Windows/Fonts/simhei.ttf")
+    elseif(WIN32 AND EXISTS "C:/Windows/Fonts/msyh.ttc")
+        set(_viewer_cjk_font "C:/Windows/Fonts/msyh.ttc")
+    endif()
+    if(NOT _viewer_cjk_font STREQUAL "")
+        add_custom_command(
+            TARGET volume_surface_viewer
+            POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:volume_surface_viewer>/assets/fonts"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_viewer_cjk_font}"
+                "$<TARGET_FILE_DIR:volume_surface_viewer>/assets/fonts/Roboto-Medium.ttf"
+            COMMENT "Installing a CJK-capable ImGui font"
+            VERBATIM
+        )
+    endif()
+
     set(_viewer_state_header
         "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/viewer/ViewerState.h")
     set(_document_session_header
@@ -268,6 +320,15 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetCacheRepository.cpp"
         PROPERTIES OBJECT_DEPENDS
             "${_surface_target_header};${_surface_normal_field_header};${_viewer_state_header};${_document_session_header}")
+
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushCursorRenderer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushHeatmapRenderer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceFitExpansionDebugRenderer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceFitPlaneRenderer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetPointPicker.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetPreview.cpp"
+        PROPERTIES OBJECT_DEPENDS "${RESGEN_HEADER}")
 
     volume_surface_copy_openvdb_runtime(volume_surface_viewer)
 endif()

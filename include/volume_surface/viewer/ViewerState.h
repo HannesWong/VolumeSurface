@@ -32,6 +32,8 @@
 #include "volume_surface/viewer/ReconstructionPick.h"
 #include "volume_surface/viewer/SliceRenderer.h"
 #include "volume_surface/viewer/SurfaceFitPlaneRenderer.h"
+#include "volume_surface/viewer/SurfaceFitExpansionDebugRenderer.h"
+#include "volume_surface/viewer/SurfaceTargetPointPicker.h"
 #include "volume_surface/viewer/SurfaceNormalSeedStore.h"
 #include "volume_surface/viewer/ViewerContext.h"
 #include "volume_surface/viewer/WorkflowController.h"
@@ -70,6 +72,7 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     bool normalFieldPreviewDirty = false;
     std::string normalFieldStatus = "Normal field has not been built";
     volume_surface::SurfaceNormalField orientedNormalField;
+    volume_surface::SurfaceNormalExpansionTrace orientedNormalExpansionTrace;
     bool orientedNormalFieldReady = false;
     std::string orientedNormalStatus = "Orientation seed has not been applied";
     volume_surface::SurfaceNormalAdjacencyStatistics normalFitAdjacencyStatistics;
@@ -101,7 +104,16 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     std::size_t brushStrokeCount = 0;
     volume_surface::SurfaceBrushResult brushResult;
     volume_surface::SurfaceTargetPreview surfaceTargetPreview;
+    SurfaceTargetPointPicker surfaceTargetPointPicker;
     SurfaceFitPlaneRenderer surfaceFitPlaneRenderer;
+    SurfaceFitExpansionDebugRenderer surfaceFitExpansionDebugRenderer;
+    volume_surface::SurfaceNormalExpansionNeighborhood surfaceFitExpansionNeighborhood;
+    std::int32_t surfaceFitExpansionParentDepthThreshold = 0;
+    bool surfaceFitExpansionPickArmed = false;
+    bool surfaceFitExpansionPickRequested = false;
+    int surfaceFitExpansionPickX = 0;
+    int surfaceFitExpansionPickY = 0;
+    std::string surfaceFitExpansionStatus = "No debug Core point selected";
     SurfaceNormalSeed surfaceNormalSeed;
     std::filesystem::path surfaceNormalSeedPath;
     std::string surfaceNormalSeedStatus = "No saved orientation seed";

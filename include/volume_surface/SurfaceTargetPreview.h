@@ -25,8 +25,9 @@ public:
         bool showBvh = false;
         bool showCore = true;
         bool showTransition = true;
-        bool frontFacingOnly = true;
-        std::size_t pointStride = 32;
+        // Retained for settings compatibility; normal lines are always double-sided.
+        bool frontFacingOnly = false;
+        std::size_t pointStride = 8;
         std::size_t bvhDepth = 3;
         float pointScale = 1.0f;
     };

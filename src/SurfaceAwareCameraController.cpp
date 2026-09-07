@@ -91,7 +91,7 @@ bool SurfaceAwareCameraController::updateDrag(
 
     if (mDragMode == DragMode::Pan) {
         openvdb::Vec3d currentPoint;
-        if (!intersectPanPlane(ray, currentPoint)) {
+        if (!intersectPanPlane(ray, mDragStartPose.eye, currentPoint)) {
             return false;
         }
         const openvdb::Vec3d translation = mPanAnchor - currentPoint;
@@ -280,18 +280,19 @@ openvdb::Vec3d SurfaceAwareCameraController::rotateAroundAxis(
 
 bool SurfaceAwareCameraController::intersectPanPlane(
     const CameraPickRay& ray,
+    const openvdb::Vec3d& rayOrigin,
     openvdb::Vec3d& point) const noexcept
 {
     const double denominator = mPanPlaneNormal.dot(ray.direction);
     if (!std::isfinite(denominator) || std::abs(denominator) <= kEpsilon) {
         return false;
     }
-    const double distance = (mPanAnchor - ray.origin).dot(mPanPlaneNormal) /
+    const double distance = (mPanAnchor - rayOrigin).dot(mPanPlaneNormal) /
         denominator;
     if (!std::isfinite(distance) || distance <= 0.0) {
         return false;
     }
-    point = ray.origin + ray.direction * distance;
+    point = rayOrigin + ray.direction * distance;
     return finiteVector(point);
 }
 

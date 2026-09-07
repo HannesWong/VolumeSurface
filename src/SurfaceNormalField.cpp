@@ -56,6 +56,38 @@ openvdb::Vec3d normalizeOrZero(openvdb::Vec3d value)
     return value / length;
 }
 
+bool surfaceContinuationAllowed(
+    const SurfaceTargetCache& target,
+    std::size_t firstSampleIndex,
+    std::size_t secondSampleIndex,
+    const openvdb::Vec3d& firstNormal,
+    const openvdb::Vec3d& secondNormal,
+    double maximumSurfaceNormalComponent) noexcept
+{
+    if (firstSampleIndex >= target.samples.size() ||
+        secondSampleIndex >= target.samples.size() ||
+        !std::isfinite(maximumSurfaceNormalComponent) ||
+        maximumSurfaceNormalComponent < 0.0 ||
+        maximumSurfaceNormalComponent > 1.0) {
+        return false;
+    }
+    const openvdb::Vec3d displacement = openvdb::Vec3d(
+        target.samples[secondSampleIndex].worldPosition) -
+        openvdb::Vec3d(target.samples[firstSampleIndex].worldPosition);
+    const double length = displacement.length();
+    if (!std::isfinite(length) || length <= kEpsilon) {
+        return false;
+    }
+    const openvdb::Vec3d direction = displacement / length;
+    const openvdb::Vec3d firstAxis = normalizeOrZero(firstNormal);
+    const openvdb::Vec3d secondAxis = normalizeOrZero(secondNormal);
+    if (firstAxis.lengthSqr() <= kEpsilon || secondAxis.lengthSqr() <= kEpsilon) {
+        return false;
+    }
+    return std::abs(direction.dot(firstAxis)) <= maximumSurfaceNormalComponent &&
+        std::abs(direction.dot(secondAxis)) <= maximumSurfaceNormalComponent;
+}
+
 openvdb::Vec3d smallestEigenvector(Matrix3 matrix)
 {
     Matrix3 eigenvectors{{
@@ -568,6 +600,38 @@ SurfaceNormalField fitSurfaceTargetNormals(
     return fitSurfaceTargetNormalsImpl(target, settings, &grid);
 }
 
+SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
+    const SurfaceTargetCache& target,
+    std::size_t centerSampleIndex,
+    SurfaceFitNeighborhood neighborhood)
+{
+    SurfaceFitNeighborhoodInspection result;
+    if (centerSampleIndex >= target.samples.size() ||
+        target.samples[centerSampleIndex].kind != SurfaceTargetSampleKind::Core) {
+        return result;
+    }
+
+    std::vector<std::size_t> coreSampleIndices;
+    std::unordered_map<openvdb::Coord, std::size_t, CoordHasher> coreIndices;
+    collectCoreIndices(target, coreSampleIndices, coreIndices);
+    const auto candidates = collectConnectedNeighborhood(
+        target,
+        coreIndices,
+        centerSampleIndex,
+        fitNeighborhoodDefinition(neighborhood));
+    if (candidates.empty()) {
+        return result;
+    }
+
+    result.valid = true;
+    result.centerSampleIndex = centerSampleIndex;
+    result.sampleIndices.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        result.sampleIndices.push_back(candidate.sampleIndex);
+    }
+    return result;
+}
+
 SurfaceNormalField smoothSurfaceTargetNormals(
     const SurfaceTargetCache& target,
     const SurfaceNormalField& seed,
@@ -729,7 +793,8 @@ SurfaceNormalField orientSurfaceTargetNormals(
     const SurfaceNormalField& axes,
     std::size_t seedSampleIndex,
     const openvdb::Vec3d& seedDirection,
-    const SurfaceNormalOrientationSettings& settings)
+    const SurfaceNormalOrientationSettings& settings,
+    SurfaceNormalExpansionTrace* expansionTrace)
 {
     if (target.empty()) {
         return {};
@@ -739,13 +804,25 @@ SurfaceNormalField orientSurfaceTargetNormals(
     }
     if (!seedDirection.isFinite() || seedDirection.lengthSqr() <= kEpsilon ||
         !std::isfinite(settings.minimumAlignment) ||
-        settings.minimumAlignment < 0.0 || settings.minimumAlignment > 1.0) {
+        settings.minimumAlignment < 0.0 || settings.minimumAlignment > 1.0 ||
+        !std::isfinite(settings.maximumSurfaceNormalComponent) ||
+        settings.maximumSurfaceNormalComponent < 0.0 ||
+        settings.maximumSurfaceNormalComponent > 1.0) {
         throw std::invalid_argument("surface normal orientation settings are invalid");
     }
 
     SurfaceNormalField result;
     result.normals.assign(target.samples.size(), openvdb::Vec3f(0.0f));
     result.coreCount = target.coreCount;
+    if (expansionTrace) {
+        expansionTrace->parentBySample.assign(
+            target.samples.size(),
+            static_cast<std::int32_t>(-1));
+        expansionTrace->depthBySample.assign(
+            target.samples.size(),
+            static_cast<std::int32_t>(-1));
+        expansionTrace->orientedBySample.assign(target.samples.size(), 0);
+    }
 
     std::vector<std::size_t> coreSampleIndices;
     std::unordered_map<openvdb::Coord, std::size_t, CoordHasher> coreIndices;
@@ -905,6 +982,10 @@ SurfaceNormalField orientSurfaceTargetNormals(
     }
     result.normals[seedCoreIndex] = openvdb::Vec3f(seedAxis);
     oriented[seedCoreIndex] = 1;
+    if (expansionTrace) {
+        expansionTrace->orientedBySample[seedCoreIndex] = 1;
+        expansionTrace->depthBySample[seedCoreIndex] = 0;
+    }
     const std::int32_t seedOrdinal = coreOrdinalBySample[seedCoreIndex];
     orientationState[static_cast<std::size_t>(seedOrdinal)] = 2;
     orientationDepth[static_cast<std::size_t>(seedOrdinal)] = 0;
@@ -972,6 +1053,15 @@ SurfaceNormalField orientSurfaceTargetNormals(
                 }
                 const double alignment = std::abs(candidateAxis.dot(sourceNormal));
                 if (alignment < settings.minimumAlignment) {
+                    continue;
+                }
+                if (!surfaceContinuationAllowed(
+                        target,
+                        fromSampleIndex,
+                        candidateSampleIndex,
+                        sourceNormal,
+                        candidateAxis,
+                        settings.maximumSurfaceNormalComponent)) {
                     continue;
                 }
                 if (orientationState[candidateOrdinal] == 0) {
@@ -1076,6 +1166,15 @@ SurfaceNormalField orientSurfaceTargetNormals(
                 if (absoluteAlignment < settings.minimumAlignment) {
                     continue;
                 }
+                if (!surfaceContinuationAllowed(
+                        target,
+                        candidateSampleIndex,
+                        supportSampleIndex,
+                        candidateAxis,
+                        sourceNormal,
+                        settings.maximumSurfaceNormalComponent)) {
+                    continue;
+                }
                 const double distanceWeight = 1.0 /
                     static_cast<double>(neighborOffsets[slot].distanceSquared);
                 const double weight = distanceWeight * absoluteAlignment * absoluteAlignment;
@@ -1094,6 +1193,15 @@ SurfaceNormalField orientSurfaceTargetNormals(
             result.normals[candidateSampleIndex] = openvdb::Vec3f(
                 signedVote < 0.0 ? -candidateAxis : candidateAxis);
             oriented[candidateSampleIndex] = 1;
+            if (expansionTrace) {
+                const std::size_t parentOrdinal = predecessor[candidateOrdinal];
+                expansionTrace->parentBySample[candidateSampleIndex] =
+                    parentOrdinal < coreSampleIndices.size()
+                    ? static_cast<std::int32_t>(coreSampleIndices[parentOrdinal])
+                    : static_cast<std::int32_t>(-1);
+                expansionTrace->depthBySample[candidateSampleIndex] = nextDepth;
+                expansionTrace->orientedBySample[candidateSampleIndex] = 1;
+            }
             orientationState[candidateOrdinal] = 2;
             orientationDepth[candidateOrdinal] = nextDepth;
             nextFrontier.push_back(candidateSampleIndex);
@@ -1140,6 +1248,15 @@ SurfaceNormalField orientSurfaceTargetNormals(
                         }
                         const double alignment = std::abs(axis.dot(neighborAxis));
                         if (alignment < settings.minimumAlignment) {
+                            continue;
+                        }
+                        if (!surfaceContinuationAllowed(
+                                target,
+                                sampleIndex,
+                                found->second,
+                                axis,
+                                neighborAxis,
+                                settings.maximumSurfaceNormalComponent)) {
                             continue;
                         }
                         const double weight = alignment * alignment;
@@ -1194,6 +1311,11 @@ SurfaceNormalField orientSurfaceTargetNormals(
         if (target.samples[sampleIndex].kind != SurfaceTargetSampleKind::Transition) {
             continue;
         }
+        const openvdb::Vec3d transitionAxis = normalizeOrZero(
+            openvdb::Vec3d(axes.normals[sampleIndex]));
+        if (transitionAxis.lengthSqr() <= kEpsilon) {
+            continue;
+        }
         const openvdb::Coord center = target.samples[sampleIndex].coordinate;
         openvdb::Vec3d sum(0.0);
         double weightSum = 0.0;
@@ -1206,6 +1328,15 @@ SurfaceNormalField orientSurfaceTargetNormals(
                     }
                     const openvdb::Vec3d normal = normalizeOrZero(
                         openvdb::Vec3d(result.normals[found->second]));
+                    if (!surfaceContinuationAllowed(
+                            target,
+                            sampleIndex,
+                            found->second,
+                            transitionAxis,
+                            normal,
+                            settings.maximumSurfaceNormalComponent)) {
+                        continue;
+                    }
                     const double weight = 1.0 /
                         (1.0 + static_cast<double>(std::max({
                             std::abs(dx), std::abs(dy), std::abs(dz)})));
@@ -1256,6 +1387,15 @@ SurfaceNormalField orientSurfaceTargetNormals(
                     if (neighbor.dot(fromNormal) < 0.0) {
                         neighbor = -neighbor;
                     }
+                    if (!surfaceContinuationAllowed(
+                            target,
+                            fromIndex,
+                            neighborIndex,
+                            fromNormal,
+                            neighbor,
+                            settings.maximumSurfaceNormalComponent)) {
+                        continue;
+                    }
                     result.normals[neighborIndex] = openvdb::Vec3f(neighbor);
                     enqueueTransition(neighborIndex);
                     ++orientedTransitionCount;
@@ -1265,6 +1405,79 @@ SurfaceNormalField orientSurfaceTargetNormals(
     }
 
     result.smoothedTransitionCount = orientedTransitionCount;
+    return result;
+}
+
+SurfaceNormalExpansionNeighborhood inspectSurfaceNormalExpansion(
+    const SurfaceTargetCache& target,
+    const SurfaceNormalExpansionTrace& expansionTrace,
+    std::size_t targetSampleIndex)
+{
+    SurfaceNormalExpansionNeighborhood result;
+    if (targetSampleIndex >= target.samples.size() ||
+        target.samples[targetSampleIndex].kind != SurfaceTargetSampleKind::Core ||
+        !expansionTrace.matchesSampleCount(target.samples.size())) {
+        return result;
+    }
+
+    const std::int32_t targetDepth = expansionTrace.depthBySample[targetSampleIndex];
+    if (targetDepth < 0) {
+        return result;
+    }
+
+    std::unordered_map<openvdb::Coord, std::size_t, CoordHasher> coreIndices;
+    coreIndices.reserve(target.coreCount * 2 + 1);
+    for (std::size_t sampleIndex = 0; sampleIndex < target.samples.size(); ++sampleIndex) {
+        if (target.samples[sampleIndex].kind == SurfaceTargetSampleKind::Core) {
+            coreIndices.emplace(target.samples[sampleIndex].coordinate, sampleIndex);
+        }
+    }
+
+    const auto appendNeighbors = [
+        &](std::size_t centerIndex,
+            std::int32_t requiredDepth,
+            std::int32_t requiredParent,
+            std::vector<std::size_t>& destination) {
+        const openvdb::Coord center = target.samples[centerIndex].coordinate;
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
+                    if (found == coreIndices.end()) {
+                        continue;
+                    }
+                    const std::size_t sampleIndex = found->second;
+                    if (expansionTrace.depthBySample[sampleIndex] != requiredDepth ||
+                        expansionTrace.parentBySample[sampleIndex] != requiredParent) {
+                        continue;
+                    }
+                    destination.push_back(sampleIndex);
+                }
+            }
+        }
+    };
+
+    result.valid = true;
+    result.targetSampleIndex = targetSampleIndex;
+    result.targetDepth = targetDepth;
+    appendNeighbors(
+        targetSampleIndex,
+        targetDepth + 1,
+        static_cast<std::int32_t>(targetSampleIndex),
+        result.targetNextSampleIndices);
+
+    const std::int32_t source = expansionTrace.parentBySample[targetSampleIndex];
+    if (source >= 0 && static_cast<std::size_t>(source) < target.samples.size()) {
+        result.sourceSampleIndex = static_cast<std::size_t>(source);
+        appendNeighbors(
+            result.sourceSampleIndex,
+            targetDepth,
+            source,
+            result.sourceBatchSampleIndices);
+    }
     return result;
 }
 

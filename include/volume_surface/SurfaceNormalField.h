@@ -40,6 +40,39 @@ struct SurfaceNormalOrientationSettings
 {
     // Reject weak local links during seed-rooted orientation propagation.
     double minimumAlignment = 0.15;
+    // Reject links whose displacement is dominated by the local surface normal.
+    double maximumSurfaceNormalComponent = 0.75;
+};
+
+struct SurfaceNormalExpansionTrace
+{
+    std::vector<std::int32_t> parentBySample;
+    std::vector<std::int32_t> depthBySample;
+    std::vector<std::uint8_t> orientedBySample;
+
+    [[nodiscard]] bool matchesSampleCount(std::size_t count) const noexcept
+    {
+        return parentBySample.size() == count &&
+            depthBySample.size() == count &&
+            orientedBySample.size() == count;
+    }
+};
+
+struct SurfaceNormalExpansionNeighborhood
+{
+    bool valid = false;
+    std::size_t targetSampleIndex = static_cast<std::size_t>(-1);
+    std::size_t sourceSampleIndex = static_cast<std::size_t>(-1);
+    std::int32_t targetDepth = -1;
+    std::vector<std::size_t> targetNextSampleIndices;
+    std::vector<std::size_t> sourceBatchSampleIndices;
+};
+
+struct SurfaceFitNeighborhoodInspection
+{
+    bool valid = false;
+    std::size_t centerSampleIndex = static_cast<std::size_t>(-1);
+    std::vector<std::size_t> sampleIndices;
 };
 
 struct SurfaceNormalAdjacencyStatistics
@@ -103,6 +136,11 @@ SurfaceNormalField fitSurfaceTargetNormals(
     const SurfaceTargetCache& target,
     const SurfaceNormalFitSettings& settings = {});
 
+SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
+    const SurfaceTargetCache& target,
+    std::size_t centerSampleIndex,
+    SurfaceFitNeighborhood neighborhood);
+
 SurfaceNormalField smoothSurfaceTargetNormals(
     const SurfaceTargetCache& target,
     const SurfaceNormalField& seed,
@@ -117,7 +155,13 @@ SurfaceNormalField orientSurfaceTargetNormals(
     const SurfaceNormalField& axes,
     std::size_t seedSampleIndex,
     const openvdb::Vec3d& seedDirection,
-    const SurfaceNormalOrientationSettings& settings = {});
+    const SurfaceNormalOrientationSettings& settings = {},
+    SurfaceNormalExpansionTrace* expansionTrace = nullptr);
+
+SurfaceNormalExpansionNeighborhood inspectSurfaceNormalExpansion(
+    const SurfaceTargetCache& target,
+    const SurfaceNormalExpansionTrace& expansionTrace,
+    std::size_t targetSampleIndex);
 
 SurfaceNormalAdjacencyStatistics analyzeSurfaceTargetNormalAdjacency(
     const SurfaceTargetCache& target,
