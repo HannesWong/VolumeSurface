@@ -21,7 +21,7 @@ const char* workflowStageName(WorkflowStage stage) noexcept
         case WorkflowStage::SurfaceFit:
             return "Surface Fit / Normal Seed";
         case WorkflowStage::NormalField:
-            return "Surface Normal";
+            return "Local Flip Points";
         case WorkflowStage::WeightPainting:
             return "Weight Painting";
         case WorkflowStage::Reconstruction:

@@ -9,10 +9,10 @@
 主流程采用单向的 Houdini 风格节点图：
 
 ```text
-Source VDB → Surface Target → Surface Fit / Normal Seed → Surface Normal → Weight Painting → Surface Reconstruction → Review / Export
+Source VDB → Surface Target → Surface Fit / Normal Seed → Local Flip Points → Weight Painting → Surface Reconstruction → Review / Export
 ```
 
-`Source VDB` 显示当前输入和来源状态。`Surface Target` 用于观察将参与后续拟合的表面目标，包括 core/transition 点、世界空间法线和 BVH 状态。`Surface Fit / Normal Seed` 使用 3×3、5×5 或 9×9 的离散连通邻域拟合局部表面趋势并生成种子法线。`Surface Normal` 可选择不做额外平均，或在种子法线上执行连通邻域趋势平均。`Weight Painting` 使用现有笔刷和权重场。`Surface Reconstruction` 预留平滑与三角网重建参数。`Review / Export` 用于对比结果并导出。
+`Source VDB` 显示当前输入和来源状态。`Surface Target` 用于观察将参与后续拟合的表面目标，包括 core/transition 点、世界空间法线和 BVH 状态。`Surface Fit / Normal Seed` 使用 3×3、5×5 或 9×9 的离散连通邻域拟合局部表面趋势并生成种子法线。`Local Flip Points` 负责拾取、预览和缓存局部翻转链。`Weight Painting` 使用现有笔刷和权重场。`Surface Reconstruction` 预留平滑与三角网重建参数。`Review / Export` 用于对比结果并导出。
 
 ## Slice Comparison 的位置
 
@@ -38,7 +38,7 @@ Slice Comparison 是全局只读检查工具，不属于主流程节点，也不
 - Source VDB：Reference mesh 和输入数据状态。
 - Surface Target：Reference、表面目标预览和 BVH/点云统计。
 - Surface Fit / Normal Seed：Reference、拟合种子法线预览。
-- Surface Normal：Reference、最终法线场预览。
+- Local Flip Points：Reference、局部翻转链预览。
 - Weight Painting：Reference、权重热力图和笔刷光标。
 - Reconstruction：Reference 与 Result A/B/C。
 - Review / Export：按结果槽选择需要比较或导出的 mesh。

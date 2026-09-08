@@ -15,6 +15,7 @@
 #include "volume_surface/SurfaceBrush.h"
 #include "volume_surface/SurfaceReconstruction.h"
 #include "volume_surface/SurfaceNormalField.h"
+#include "volume_surface/SurfaceNormalLocalSeed.h"
 #include "volume_surface/SurfaceTarget.h"
 #include "volume_surface/SurfaceTargetPreview.h"
 #include "volume_surface/viewer/SurfaceAwareCameraController.h"
@@ -33,6 +34,8 @@
 #include "volume_surface/viewer/SliceRenderer.h"
 #include "volume_surface/viewer/SurfaceFitPlaneRenderer.h"
 #include "volume_surface/viewer/SurfaceFitExpansionDebugRenderer.h"
+#include "volume_surface/viewer/SurfaceNormalLocalSeedRenderer.h"
+#include "volume_surface/viewer/SurfaceNormalLocalSeedStore.h"
 #include "volume_surface/viewer/SurfaceTargetPointPicker.h"
 #include "volume_surface/viewer/SurfaceNormalSeedStore.h"
 #include "volume_surface/viewer/ViewerContext.h"
@@ -42,6 +45,14 @@
 namespace volume_surface::viewer {
 
 struct ViewerState : DocumentSession, BrushInteractionState {
+    struct LocalNormalSeedEntry {
+        std::size_t sampleIndex = static_cast<std::size_t>(-1);
+        openvdb::Coord coordinate{};
+        std::uint8_t targetSign = 0;
+        bool accepted = false;
+        bool activeFlipPoint = true;
+        std::array<std::uint8_t, 4> color{255, 255, 255, 255};
+    };
     ViewerContext context;
     WorkflowController workflowController;
     WorkflowPanel workflowPanel;
@@ -61,6 +72,7 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     float displayScale = 1.0f;
     volume_surface::SurfaceNormalFitSettings normalFitSettings;
     volume_surface::SurfaceNormalField normalFitField;
+    volume_surface::SurfaceNormalField primaryOrientedNormalField;
     bool normalFitReady = false;
     bool normalFitPreviewActive = false;
     std::string normalFitStatus = "Fitted normal seeds have not been built";
@@ -77,6 +89,20 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     std::string orientedNormalStatus = "Orientation seed has not been applied";
     volume_surface::SurfaceNormalAdjacencyStatistics normalFitAdjacencyStatistics;
     volume_surface::SurfaceNormalAdjacencyStatistics orientedNormalAdjacencyStatistics;
+    volume_surface::SurfaceNormalLocalSeedSettings localNormalSeedSettings;
+    std::vector<LocalNormalSeedEntry> localNormalSeeds;
+    std::filesystem::path localNormalSeedPath;
+    std::string localNormalSeedCacheStatus = "No saved local flip-point cache";
+    volume_surface::SurfaceNormalLocalSeedPreview localNormalSeedPreview;
+    SurfaceNormalLocalSeedRenderer surfaceNormalLocalSeedRenderer;
+    std::size_t localNormalSeedSelected = static_cast<std::size_t>(-1);
+    bool localNormalSeedPreviewVisible = true;
+    bool localNormalSeedBoundaryVisible = true;
+    bool localNormalSeedPickArmed = false;
+    bool localNormalSeedPickRequested = false;
+    int localNormalSeedPickX = 0;
+    int localNormalSeedPickY = 0;
+    std::string localNormalSeedStatus = "No local flip point selected";
     float wheelZoomMultiplier = 12.0f;
     float wheelHitDistanceRatio = 0.15f;
     float wheelMinimumDistanceMillimeters = 1.0f;

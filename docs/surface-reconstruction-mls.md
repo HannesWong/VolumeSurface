@@ -12,7 +12,7 @@
 
 局部坐标使用世界单位，半径默认 5 mm。法线方向相反或不属于同一局部片层的样本不参加拟合。平面度只作为连续权重，不做硬阈值切换；邻域不足时退化为带正则的线性拟合。
 
-法线来源由 `Surface Fit / Normal Seed` 与 `Surface Normal` 两个流程控制：前者使用 3×3、5×5 或 9×9 的连接邻域生成拟合种子法线，后者可选择 `None` 或继续执行 3×3、5×5 的连接趋势平均。完成 Build / update 后，Reconstruction 读取最终法线场；法线流程未构建或参数刚改变时，仍会安全回退到 SurfaceTarget 的 raw normal。
+法线来源由 `Surface Fit / Normal Seed` 与 `Local Flip Points` 两个流程控制：前者使用 3×3、5×5 或 9×9 的连接邻域生成拟合种子法线，后者对显式拾取的局部翻转链进行预览和提交。Reconstruction 读取全局种子与已接受的局部翻转结果；法线流程未构建时仍会安全回退到 SurfaceTarget 的 raw normal。
 
 ## 网格化
 

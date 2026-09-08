@@ -69,6 +69,10 @@ public:
 
     void endDrag() noexcept;
 
+    // Recenter the current camera pose on a scene-space point while keeping
+    // the current view direction, distance, and up vector.
+    void focusOn(const openvdb::Vec3d& sceneTarget) noexcept;
+
     [[nodiscard]] SurfaceAwareCameraWheelResult applyWheel(
         std::int32_t rawDelta,
         const CameraPickHit& hit,

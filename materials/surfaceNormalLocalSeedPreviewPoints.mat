@@ -1,0 +1,42 @@
+material {
+    name : SurfaceNormalLocalSeedPreviewPoints,
+    requires : [
+        custom0,
+        color
+    ],
+    shadingModel : unlit,
+    blending : transparent,
+    culling : none,
+    depthWrite : false,
+    depthCulling : true,
+    parameters : [
+        {
+            type : float,
+            name : POINT_RADIUS
+        }
+    ]
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        vec4 viewPosition = getViewFromWorldMatrix() * material.worldPosition;
+        float focalPixels = 0.5 * getResolution().y *
+            getClipFromViewMatrix()[1][1];
+        gl_PointSize = max(
+            1.0,
+            2.0 * materialParams.POINT_RADIUS * focalPixels /
+                max(abs(viewPosition.z), 1.0e-4));
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        vec2 sprite = gl_PointCoord * 2.0 - 1.0;
+        if (dot(sprite, sprite) > 1.0) {
+            material.baseColor = vec4(0.0);
+            return;
+        }
+        material.baseColor = getColor();
+    }
+}

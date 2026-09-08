@@ -48,6 +48,6 @@ cmd.exe /d /c .\scripts\build_viewer_msvc_ninja.cmd
 .\build-viewer\volume_surface_viewer.exe
 ```
 
-使用 `--input`、`--grid`、`--iso` 与 `--adaptivity` 可以覆盖默认参数。使用 `--inspect-only` 只验证读取、网格和三个方向的切片提取，不创建窗口；使用 `--headless-smoke` 在隐藏窗口中验证 Filament、纹理和 ImGui 资源后自动退出。完成的连续笔画会自动追加到 `brush_profile.jsonl`；使用 `--replay-brush-profile brush_profile.jsonl` 可以在隐藏 Viewer 中重放每次拟合并输出分段性能。具体格式和比较方法见 [笔刷性能记录与回放](docs/brush-performance-replay.md)，表面 BVH 的分组和增量边界见 [表面 BVH 笔刷加速](docs/brush-surface-bvh.md)，多个可保存权重场的工作流见 [权重场库](docs/weight-field-library.md)，流程节点和 Viewer 路由见 [流程控制设计](docs/workflow-control.md)，Surface Target 的点、法线和 BVH 预览见 [Surface Target 预览](docs/surface-target-preview.md)，新的点驱动重建边界见 [表面重建重新设计](docs/surface-reconstruction-redesign.md)。
+使用 `--input`、`--grid`、`--iso` 与 `--adaptivity` 可以覆盖默认参数。使用 `--inspect-only` 只验证读取、网格和三个方向的切片提取，不创建窗口；使用 `--headless-smoke` 在隐藏窗口中验证 Filament、纹理和 ImGui 资源后自动退出。完成的连续笔画会自动追加到 `brush_profile.jsonl`；使用 `--replay-brush-profile brush_profile.jsonl` 可以在隐藏 Viewer 中重放每次拟合并输出分段性能。具体格式和比较方法见 [笔刷性能记录与回放](docs/brush-performance-replay.md)，表面 BVH 的分组和增量边界见 [表面 BVH 笔刷加速](docs/brush-surface-bvh.md)，多个可保存权重场的工作流见 [权重场库](docs/weight-field-library.md)，流程节点和 Viewer 路由见 [流程控制设计](docs/workflow-control.md)，Surface Target 的点、法线和 BVH 预览见 [Surface Target 预览](docs/surface-target-preview.md)，局部法线种子和全局种子流程见 [法线定向流程](docs/normal-orientation-pipeline.md)，新的点驱动重建边界见 [表面重建重新设计](docs/surface-reconstruction-redesign.md)。
 
 当前面板提供 Reference、Result A、Result B 和 Result C 四个显示槽位。只有 Reference 已接入 Fog 等值面；另外三个槽位预留给后续平滑结果。详细边界见 [诊断 Viewer 执行文档](docs/diagnostic-viewer.md)。

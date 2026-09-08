@@ -36,6 +36,7 @@ add_library(volume_surface_mesh
     src/SurfaceBrush.cpp
     src/SliceDiagnostics.cpp
     src/SurfaceTarget.cpp
+    src/SurfaceNormalField.cpp
     src/SurfaceReconstruction.cpp
     src/SurfaceNormalField.cpp
     src/VdbSurfaceProbe.cpp
@@ -60,8 +61,12 @@ target_compile_definitions(volume_surface_mesh
 # cannot be parsed by Ninja's dependency scanner.
 set(_surface_target_header
     "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceTarget.h")
-set(_surface_normal_field_header
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceNormalField.h")
+    set(_surface_normal_field_header
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceNormalField.h")
+    set(_surface_normal_local_seed_header
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceNormalLocalSeed.h")
+    set(_surface_normal_local_seed_store_header
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/viewer/SurfaceNormalLocalSeedStore.h")
 set_source_files_properties(
     src/SurfaceTarget.cpp
     src/SurfaceReconstruction.cpp
@@ -69,7 +74,8 @@ set_source_files_properties(
     src/reconstruction_info.cpp
     tests/SurfaceReconstructionTests.cpp
     tests/SurfaceTargetTests.cpp
-    PROPERTIES OBJECT_DEPENDS "${_surface_target_header};${_surface_normal_field_header}")
+    PROPERTIES OBJECT_DEPENDS
+        "${_surface_target_header};${_surface_normal_field_header};${_surface_normal_local_seed_header}")
 
 add_executable(vdb_brick_cache
     src/main.cpp
@@ -107,6 +113,7 @@ volume_surface_copy_openvdb_runtime(vdb_surface_reconstruction_info)
 add_executable(surface_normal_diagnostics_info
     src/normal_diagnostics_info.cpp
     src/SurfaceTargetCacheRepository.cpp
+    src/SurfaceNormalLocalSeedStore.cpp
     src/SurfaceNormalSeedStore.cpp
 )
 
@@ -139,6 +146,10 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitExpansionDebugPoints.mat")
     set(_surface_fit_expansion_points_package
         "${_viewer_material_dir}/surfaceFitExpansionDebugPoints.filamat")
+    set(_surface_normal_local_seed_points_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceNormalLocalSeedPreviewPoints.mat")
+    set(_surface_normal_local_seed_points_package
+        "${_viewer_material_dir}/surfaceNormalLocalSeedPreviewPoints.filamat")
     set(_surface_fit_plane_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitPlane.mat")
     set(_surface_fit_plane_package "${_viewer_material_dir}/surfaceFitPlane.filamat")
     add_custom_command(
@@ -211,6 +222,16 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         COMMENT "Compiling SurfaceFit expansion selected point material"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${_surface_normal_local_seed_points_package}"
+        COMMAND matc ${MATC_BASE_FLAGS}
+            -o "${_surface_normal_local_seed_points_package}"
+            "${_surface_normal_local_seed_points_source}"
+        MAIN_DEPENDENCY "${_surface_normal_local_seed_points_source}"
+        DEPENDS matc
+        COMMENT "Compiling local normal seed preview point material"
+        VERBATIM
+    )
 
     get_resgen_vars("${_viewer_resource_dir}" volume_surface_viewer_resources)
     add_custom_command(
@@ -222,6 +243,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             "${_surface_target_point_pick_package}"
             "${_surface_target_debug_package}"
             "${_surface_fit_expansion_points_package}"
+            "${_surface_normal_local_seed_points_package}"
             "${_surface_fit_plane_package}"
         DEPENDS resgen
             "${_brush_heatmap_package}"
@@ -230,6 +252,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             "${_surface_target_point_pick_package}"
             "${_surface_target_debug_package}"
             "${_surface_fit_expansion_points_package}"
+            "${_surface_normal_local_seed_points_package}"
             "${_surface_fit_plane_package}"
         COMMENT "Embedding viewer materials"
         VERBATIM
@@ -266,6 +289,8 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         src/SurfaceTargetPointPicker.cpp
         src/SurfaceFitPlaneRenderer.cpp
         src/SurfaceFitExpansionDebugRenderer.cpp
+        src/SurfaceNormalLocalSeedRenderer.cpp
+        src/SurfaceNormalLocalSeedStore.cpp
         src/SurfaceNormalSeedStore.cpp
         src/SurfaceTargetCacheRepository.cpp
         src/WorkflowController.cpp
@@ -319,12 +344,13 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/WorkflowPanel.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetCacheRepository.cpp"
         PROPERTIES OBJECT_DEPENDS
-            "${_surface_target_header};${_surface_normal_field_header};${_viewer_state_header};${_document_session_header}")
+            "${_surface_target_header};${_surface_normal_field_header};${_surface_normal_local_seed_header};${_surface_normal_local_seed_store_header};${_viewer_state_header};${_document_session_header}")
 
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushCursorRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushHeatmapRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceFitExpansionDebugRenderer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceNormalLocalSeedRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceFitPlaneRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetPointPicker.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetPreview.cpp"
@@ -398,6 +424,7 @@ if(VOLUME_SURFACE_BUILD_TESTS)
 
     add_executable(surface_target_tests
         tests/SurfaceTargetTests.cpp
+        src/SurfaceNormalLocalSeedStore.cpp
     )
 
     target_link_libraries(surface_target_tests

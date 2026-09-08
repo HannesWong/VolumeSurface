@@ -1,6 +1,8 @@
 #include "volume_surface/SurfaceTarget.h"
 #include "volume_surface/SurfaceNormalField.h"
+#include "volume_surface/SurfaceNormalLocalSeed.h"
 #include "volume_surface/VdbSurfaceProbe.h"
+#include "volume_surface/viewer/SurfaceNormalLocalSeedStore.h"
 
 #include <openvdb/openvdb.h>
 
@@ -50,6 +52,62 @@ const volume_surface::SurfaceTargetSample* findSample(
         }
     }
     return nullptr;
+}
+
+openvdb::FloatGrid::Ptr createMetricGrid(const openvdb::Vec3d& voxelSize)
+{
+    auto grid = openvdb::FloatGrid::create(0.0f);
+    grid->setGridClass(openvdb::GRID_FOG_VOLUME);
+    grid->setTransform(openvdb::math::Transform::createLinearTransform(
+        openvdb::math::scale<openvdb::math::Mat4d>(voxelSize)));
+    return grid;
+}
+
+volume_surface::SurfaceTargetCache createCoreSheet(
+    const openvdb::FloatGrid& grid,
+    int firstCount,
+    int secondCount,
+    bool normalAlongX)
+{
+    volume_surface::SurfaceTargetCache cache;
+    cache.samples.reserve(static_cast<std::size_t>(firstCount * secondCount));
+    for (int second = 0; second < secondCount; ++second) {
+        for (int first = 0; first < firstCount; ++first) {
+            volume_surface::SurfaceTargetSample sample;
+            sample.coordinate = normalAlongX
+                ? openvdb::Coord(0, first, second)
+                : openvdb::Coord(first, second, 0);
+            sample.worldPosition = openvdb::Vec3f(
+                grid.indexToWorld(sample.coordinate.asVec3d()));
+            sample.kind = volume_surface::SurfaceTargetSampleKind::Core;
+            cache.samples.push_back(sample);
+        }
+    }
+    cache.coreCount = cache.samples.size();
+    return cache;
+}
+
+volume_surface::SurfaceNormalField createUniformNormalField(
+    const volume_surface::SurfaceTargetCache& cache,
+    const openvdb::Vec3f& normal)
+{
+    volume_surface::SurfaceNormalField field;
+    field.normals.assign(cache.samples.size(), normal);
+    field.coreCount = cache.coreCount;
+    field.smoothedCoreCount = cache.coreCount;
+    return field;
+}
+
+std::size_t findSampleIndex(
+    const volume_surface::SurfaceTargetCache& cache,
+    const openvdb::Coord& coordinate)
+{
+    for (std::size_t index = 0; index < cache.samples.size(); ++index) {
+        if (cache.samples[index].coordinate == coordinate) {
+            return index;
+        }
+    }
+    throw std::runtime_error("synthetic surface target sample is missing");
 }
 
 void testCoreAndTransitionSamples()
@@ -168,6 +226,60 @@ void testCacheSaveLoadRoundTrip()
                 loaded,
                 &error),
         "surface target cache accepted mismatched metadata");
+    std::filesystem::remove(path, errorCode);
+}
+
+void testLocalNormalSeedStoreRoundTrip()
+{
+    volume_surface::SurfaceTargetCacheMetadata metadata;
+    metadata.sourcePath = "synthetic/layered.vdb";
+    metadata.gridName = "density";
+    metadata.sourceFileSize = 1234;
+    metadata.sourceWriteTime = 5678;
+    metadata.settings.isoValue = 255.0;
+    metadata.settings.transitionLayers = 2;
+
+    const std::vector<volume_surface::viewer::SurfaceNormalLocalSeedRecord> seeds{
+        {openvdb::Coord(1, 2, 3), 1},
+        {openvdb::Coord(-4, 5, -6), 0},
+        {openvdb::Coord(7, 8, 9), 1, false}};
+    const auto path = std::filesystem::current_path() /
+        "surface-target-local-seeds-roundtrip.jsonl";
+    std::error_code errorCode;
+    std::filesystem::remove(path, errorCode);
+    std::string error;
+    require(volume_surface::viewer::SurfaceNormalLocalSeedStore::save(
+                path,
+                seeds,
+                metadata,
+                error),
+        "local normal seed cache save failed");
+
+    std::vector<volume_surface::viewer::SurfaceNormalLocalSeedRecord> loaded;
+    require(volume_surface::viewer::SurfaceNormalLocalSeedStore::load(
+                path,
+                metadata,
+                loaded,
+                error),
+        "local normal seed cache load failed");
+    require(loaded.size() == seeds.size() &&
+            loaded[0].coordinate == seeds[0].coordinate &&
+            loaded[0].targetSign == seeds[0].targetSign &&
+            loaded[1].coordinate == seeds[1].coordinate &&
+            loaded[1].targetSign == seeds[1].targetSign &&
+            loaded[0].activeFlipPoint && loaded[1].activeFlipPoint &&
+            loaded[2].coordinate == seeds[2].coordinate &&
+            !loaded[2].activeFlipPoint,
+        "local normal seed cache round trip changed records");
+
+    auto mismatchedMetadata = metadata;
+    mismatchedMetadata.settings.isoValue = 254.0;
+    require(!volume_surface::viewer::SurfaceNormalLocalSeedStore::load(
+                path,
+                mismatchedMetadata,
+                loaded,
+                error),
+        "local normal seed cache accepted mismatched metadata");
     std::filesystem::remove(path, errorCode);
 }
 
@@ -299,6 +411,271 @@ void testConnectedNormalTrend()
         "normal adjacency analysis misclassified the seeded component");
 }
 
+void testFitSignIslandRepair()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.00031, 0.00031, 0.001));
+    const auto cache = createCoreSheet(*grid, 11, 11, false);
+    auto raw = createUniformNormalField(cache, openvdb::Vec3f(0.0f, 0.0f, 1.0f));
+    for (int y = 4; y <= 6; ++y) {
+        for (int x = 4; x <= 6; ++x) {
+            raw.normals[findSampleIndex(cache, openvdb::Coord(x, y, 0))] *= -1.0f;
+        }
+    }
+
+    volume_surface::SurfaceNormalFitSignRepairSettings settings;
+    settings.maximumIslandAreaSquareMillimeters = 2.0;
+    const auto repaired = volume_surface::repairSurfaceNormalFitSignIslands(
+        *grid,
+        cache,
+        raw,
+        settings);
+    require(repaired.report.validCoreEdgeCount > 0,
+        "fit sign repair did not evaluate core adjacency edges");
+    require(repaired.report.candidateIslandCount > 0 &&
+            repaired.report.acceptedIslandCount == 1 &&
+            repaired.report.flippedCoreSampleCount == 9,
+        "fit sign repair did not accept the reversed small island");
+    require(repaired.report.weightedOpposingSupportAfter <
+            repaired.report.weightedOpposingSupportBefore,
+        "fit sign repair did not reduce opposing boundary support");
+    for (const auto& normal : repaired.field.normals) {
+        require(normal.z() > 0.99f,
+            "fit sign repair left a reversed sample in the small island");
+    }
+}
+
+void testFitSignRepairLeavesComparableRegionsUntouched()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.00031, 0.00031, 0.001));
+    const auto cache = createCoreSheet(*grid, 10, 6, false);
+    auto raw = createUniformNormalField(cache, openvdb::Vec3f(0.0f, 0.0f, 1.0f));
+    for (int y = 0; y < 6; ++y) {
+        for (int x = 0; x < 5; ++x) {
+            raw.normals[findSampleIndex(cache, openvdb::Coord(x, y, 0))] *= -1.0f;
+        }
+    }
+
+    volume_surface::SurfaceNormalFitSignRepairSettings settings;
+    settings.maximumIslandAreaSquareMillimeters = 100.0;
+    const auto repaired = volume_surface::repairSurfaceNormalFitSignIslands(
+        *grid,
+        cache,
+        raw,
+        settings);
+    require(repaired.report.acceptedIslandCount == 0,
+        "fit sign repair changed similarly sized opposing regions");
+    require(repaired.field.normals[findSampleIndex(cache, openvdb::Coord(0, 0, 0))].z() < -0.99f,
+        "fit sign repair changed the comparable region orientation");
+}
+
+void testFitSignRepairLeavesDisconnectedIslandUntouched()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.00031, 0.00031, 0.001));
+    auto cache = createCoreSheet(*grid, 8, 8, false);
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            volume_surface::SurfaceTargetSample sample;
+            sample.coordinate = openvdb::Coord(30 + x, y, 0);
+            sample.worldPosition = openvdb::Vec3f(
+                grid->indexToWorld(sample.coordinate.asVec3d()));
+            sample.kind = volume_surface::SurfaceTargetSampleKind::Core;
+            cache.samples.push_back(sample);
+        }
+    }
+    cache.coreCount = cache.samples.size();
+    auto raw = createUniformNormalField(cache, openvdb::Vec3f(0.0f, 0.0f, 1.0f));
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            raw.normals[findSampleIndex(cache, openvdb::Coord(30 + x, y, 0))] *= -1.0f;
+        }
+    }
+
+    const auto repaired = volume_surface::repairSurfaceNormalFitSignIslands(
+        *grid,
+        cache,
+        raw);
+    require(repaired.report.acceptedIslandCount == 0,
+        "fit sign repair changed a disconnected island");
+    require(repaired.field.normals[findSampleIndex(cache, openvdb::Coord(30, 0, 0))].z() < -0.99f,
+        "fit sign repair changed the disconnected island orientation");
+}
+
+void testFitSignRepairUsesPhysicalArea()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.00031, 0.00031, 0.004));
+    const auto cache = createCoreSheet(*grid, 11, 11, true);
+    auto raw = createUniformNormalField(cache, openvdb::Vec3f(1.0f, 0.0f, 0.0f));
+    for (int z = 4; z <= 6; ++z) {
+        for (int y = 4; y <= 6; ++y) {
+            raw.normals[findSampleIndex(cache, openvdb::Coord(0, y, z))] *= -1.0f;
+        }
+    }
+
+    volume_surface::SurfaceNormalFitSignRepairSettings settings;
+    settings.maximumIslandAreaSquareMillimeters = 2.0;
+    const auto rejected = volume_surface::repairSurfaceNormalFitSignIslands(
+        *grid,
+        cache,
+        raw,
+        settings);
+    require(rejected.report.acceptedIslandCount == 0,
+        "fit sign repair ignored the anisotropic physical area");
+
+    settings.maximumIslandAreaSquareMillimeters = 20.0;
+    const auto accepted = volume_surface::repairSurfaceNormalFitSignIslands(
+        *grid,
+        cache,
+        raw,
+        settings);
+    require(accepted.report.acceptedIslandCount == 1 &&
+            accepted.report.acceptedPatches.front().areaSquareMillimeters > 10.0,
+        "fit sign repair did not report anisotropic physical island area");
+}
+
+void testFitSignRepairProtectsSeedNeighborhood()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.00031, 0.00031, 0.001));
+    const auto cache = createCoreSheet(*grid, 11, 11, false);
+    auto primary = createUniformNormalField(cache, openvdb::Vec3f(0.0f, 0.0f, 1.0f));
+    for (int y = 4; y <= 6; ++y) {
+        for (int x = 4; x <= 6; ++x) {
+            primary.normals[findSampleIndex(cache, openvdb::Coord(x, y, 0))] *= -1.0f;
+        }
+    }
+
+    volume_surface::SurfaceNormalExpansionTrace trace;
+    trace.parentBySample.assign(cache.samples.size(), -1);
+    trace.depthBySample.assign(cache.samples.size(), 10);
+    trace.orientedBySample.assign(cache.samples.size(), 1);
+    trace.depthBySample[findSampleIndex(cache, openvdb::Coord(5, 5, 0))] = 0;
+
+    volume_surface::SurfaceNormalFitSignRepairSettings settings;
+    settings.maximumIslandAreaSquareMillimeters = 100.0;
+    const auto repaired = volume_surface::repairSurfaceNormalFitSignIslands(
+        *grid,
+        cache,
+        primary,
+        settings,
+        &trace);
+    require(repaired.report.acceptedIslandCount == 0 &&
+            repaired.report.flippedCoreSampleCount == 0,
+        "fit sign repair changed a region containing the protected seed neighborhood");
+}
+
+void testLocalNormalSeedPreviewAndApply()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.00031, 0.00031, 0.001));
+    const auto cache = createCoreSheet(*grid, 11, 11, false);
+    const auto axes = createUniformNormalField(cache, openvdb::Vec3f(0.0f, 0.0f, 1.0f));
+    auto global = axes;
+    for (int y = 4; y <= 6; ++y) {
+        for (int x = 4; x <= 6; ++x) {
+            global.normals[findSampleIndex(cache, openvdb::Coord(x, y, 0))] *= -1.0f;
+        }
+    }
+    const std::size_t seedIndex = findSampleIndex(cache, openvdb::Coord(5, 5, 0));
+    const auto preview = volume_surface::previewSurfaceNormalLocalSeed(
+        cache,
+        axes,
+        global,
+        seedIndex);
+    require(preview.valid && preview.affectedCoreSampleCount == 9,
+        "local seed preview did not isolate the reversed region");
+    require(preview.boundaryCoreSampleCount > 0,
+        "local seed preview did not record a stopping boundary");
+    const auto applied = volume_surface::applySurfaceNormalLocalSeed(
+        cache,
+        global,
+        preview);
+    for (const auto& normal : applied.normals) {
+        require(normal.z() > 0.99f,
+            "local seed apply left a reversed sample");
+    }
+}
+
+void testLocalFlipPointChainAndCap()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.001, 0.001, 0.001));
+    const auto cache = createCoreSheet(*grid, 7, 1, false);
+    const auto axes = createUniformNormalField(cache, openvdb::Vec3f(0.0f, 0.0f, 1.0f));
+    auto global = axes;
+    for (int x = 2; x <= 4; ++x) {
+        global.normals[findSampleIndex(cache, openvdb::Coord(x, 0, 0))] *= -1.0f;
+    }
+    const std::size_t flipPoint = findSampleIndex(cache, openvdb::Coord(3, 0, 0));
+    const auto preview = volume_surface::previewSurfaceNormalLocalFlipPoint(
+        cache,
+        axes,
+        global,
+        flipPoint);
+    require(preview.valid && preview.affectedCoreSampleCount == 3,
+        "flip point propagation did not follow the consecutive opposing chain");
+    require(preview.parentBySample[findSampleIndex(cache, openvdb::Coord(2, 0, 0))] ==
+                static_cast<std::int32_t>(flipPoint),
+        "flip point chain did not retain the parent link");
+
+    auto cappedSettings = volume_surface::SurfaceNormalLocalSeedSettings{};
+    cappedSettings.maximumCoreSamples = 2;
+    const auto capped = volume_surface::previewSurfaceNormalLocalFlipPoint(
+        cache,
+        axes,
+        global,
+        flipPoint,
+        cappedSettings);
+    require(capped.maximumCoreSamplesReached,
+        "flip point preview did not report the sample cap");
+    const auto unchanged = volume_surface::applySurfaceNormalLocalFlipPoint(
+        cache,
+        global,
+        capped);
+    require(unchanged.normals[flipPoint].z() < -0.99f,
+        "capped flip point preview was committed as a partial correction");
+}
+
+void testLocalFlipPointFollowsExpansionChildrenOnly()
+{
+    const auto grid = createMetricGrid(openvdb::Vec3d(0.001, 0.001, 0.001));
+    const auto cache = createCoreSheet(*grid, 7, 1, false);
+    const auto axes = createUniformNormalField(cache, openvdb::Vec3f(0.0f, 0.0f, 1.0f));
+    auto global = axes;
+    for (int x = 2; x <= 4; ++x) {
+        global.normals[findSampleIndex(cache, openvdb::Coord(x, 0, 0))] *= -1.0f;
+    }
+
+    const std::size_t upstream = findSampleIndex(cache, openvdb::Coord(2, 0, 0));
+    const std::size_t flipPoint = findSampleIndex(cache, openvdb::Coord(3, 0, 0));
+    const std::size_t downstream = findSampleIndex(cache, openvdb::Coord(4, 0, 0));
+    volume_surface::SurfaceNormalExpansionTrace trace;
+    trace.parentBySample.assign(cache.samples.size(), -1);
+    trace.depthBySample.assign(cache.samples.size(), -1);
+    trace.orientedBySample.assign(cache.samples.size(), 1);
+    trace.parentBySample[flipPoint] = static_cast<std::int32_t>(upstream);
+    trace.parentBySample[downstream] = static_cast<std::int32_t>(flipPoint);
+    trace.depthBySample[upstream] = 0;
+    trace.depthBySample[flipPoint] = 1;
+    trace.depthBySample[downstream] = 2;
+
+    const auto preview = volume_surface::previewSurfaceNormalLocalFlipPoint(
+        cache,
+        axes,
+        global,
+        flipPoint,
+        {},
+        &trace);
+    require(preview.valid && preview.affectedCoreSampleCount == 2,
+        "directed flip point propagation did not isolate the downstream chain");
+    require(std::find(
+                preview.affectedCoreSampleIndices.begin(),
+                preview.affectedCoreSampleIndices.end(),
+                upstream) == preview.affectedCoreSampleIndices.end(),
+        "directed flip point propagation changed an upstream sample");
+    require(std::find(
+                preview.affectedCoreSampleIndices.begin(),
+                preview.affectedCoreSampleIndices.end(),
+                downstream) != preview.affectedCoreSampleIndices.end(),
+        "directed flip point propagation skipped a downstream sample");
+}
+
 void testVdbSurfaceProbe()
 {
     const auto grid = createLayeredFog();
@@ -325,7 +702,16 @@ int main()
         openvdb::initialize();
         testCoreAndTransitionSamples();
         testCacheSaveLoadRoundTrip();
+        testLocalNormalSeedStoreRoundTrip();
         testConnectedNormalTrend();
+        testFitSignIslandRepair();
+        testFitSignRepairLeavesComparableRegionsUntouched();
+        testFitSignRepairLeavesDisconnectedIslandUntouched();
+        testFitSignRepairUsesPhysicalArea();
+        testFitSignRepairProtectsSeedNeighborhood();
+        testLocalNormalSeedPreviewAndApply();
+        testLocalFlipPointChainAndCap();
+        testLocalFlipPointFollowsExpansionChildrenOnly();
         testVdbSurfaceProbe();
         std::cout << "surface_target_tests passed\n";
         return EXIT_SUCCESS;

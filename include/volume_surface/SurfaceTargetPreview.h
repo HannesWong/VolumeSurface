@@ -24,10 +24,10 @@ public:
         bool showNormals = false;
         bool showBvh = false;
         bool showCore = true;
-        bool showTransition = true;
+        bool showTransition = false;
         // Retained for settings compatibility; normal lines are always double-sided.
         bool frontFacingOnly = false;
-        std::size_t pointStride = 8;
+        std::size_t pointStride = 1;
         std::size_t bvhDepth = 3;
         float pointScale = 1.0f;
     };

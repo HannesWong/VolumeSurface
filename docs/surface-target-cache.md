@@ -2,7 +2,7 @@
 
 ## 文件位置
 
-Surface Target 使用与输入 VDB 同目录的 sidecar 文件保存，不压缩样本数据。文件名为 `<输入文件名去扩展名>.<grid 名>.surface-target.bin`，例如 `rightArm.0224.density.surface-target.bin`。
+Surface Target 使用与输入 VDB 同目录的 sidecar 文件保存，不压缩样本数据。几何样本文件名为 `<输入文件名去扩展名>.<grid 名>.surface-target.bin`，例如 `rightArm.0224.density.surface-target.bin`。局部翻转点作为同一 cache package 的独立 JSONL 文件保存：`<输入文件名去扩展名>.<grid 名>.surface-target.local-seeds.jsonl`（文件名保留以兼容已有缓存）。
 
 ## 自动流程
 
@@ -10,7 +10,7 @@ Surface Target 使用与输入 VDB 同目录的 sidecar 文件保存，不压缩
 
 ## 数据内容
 
-缓存保存 core/transition 样本的坐标、世界坐标、法线、密度、平面度、角度偏差、支持权重、过渡层数和样本类型，同时保存用于失效判断的元数据。格式带有 magic 和版本号，加载时会校验样本数量、分类计数和元数据；损坏或过期的文件不会替换当前内存中的缓存。
+二进制缓存保存 core/transition 样本的坐标、世界坐标、法线、密度、平面度、角度偏差、支持权重、过渡层数和样本类型，同时保存用于失效判断的元数据。格式带有 magic 和版本号，加载时会校验样本数量、分类计数和元数据；损坏或过期的文件不会替换当前内存中的缓存。局部翻转点文件只保存坐标和目标方向，并复用来源、grid、isoValue、transitionLayers、源文件大小与写入时间做失效判断。
 
 ## 兼容性边界
 
@@ -23,3 +23,11 @@ Surface Target 使用与输入 VDB 同目录的 sidecar 文件保存，不压缩
 如果某个交点的三线性梯度退化为零，只在该样本上使用中心差分作为数值安全兜底，不改变正常样本的法线估计策略。缓存同时保存 planarity、角度偏差和 support weight 等辅助元数据。
 
 `normalRadius` 字段暂时保留在元数据中以兼容已有接口，但不再参与法线计算。版本号变化会使旧 sidecar 自动失效，避免旧的平滑法线混入新的连通趋势流程。
+
+## 局部 flip point 自动缓存
+
+局部 flip point 在 Local Flip Points 面板中执行 Add 后立即写入 JSONL、启用并重放；`Replay selected flip point` 可再次执行同一点的回放；删除 flip point 后也立即重写该小文件。应用加载几何缓存后会自动读取有效的局部 flip point，按保存顺序在全局 seed 基线之上重放，并重新计算 affected/boundary 区域。affected/boundary 点集不落盘，避免平滑参数或拒止边界策略变化后继续使用过期结果。旧文件中的 `seed` 记录仍可读取，但会作为 legacy inactive 保留，不会自动参与翻转；新保存的记录使用 `flip_point`。
+
+## 局部 flip point 诊断参数
+
+`surface_normal_diagnostics_info` 的第 5–8 个可选参数依次覆盖局部最大 Core 数量、局部最大距离（mm）、局部最小轴向对齐度和表面连续性分量阈值。诊断输出会同时给出每类拒止原因和是否撞到最大 Core 数量上限，用于区分物理距离限制、几何连续性限制与紧急截断。

@@ -257,7 +257,7 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
             : stage == WorkflowStage::SurfaceFit
                 ? "Surface Fit"
             : stage == WorkflowStage::NormalField
-                ? "Surface Normal"
+                ? "Local Flip Points"
             : stage == WorkflowStage::WeightPainting
                 ? "Weight Painting"
                 : stage == WorkflowStage::Reconstruction
@@ -284,7 +284,7 @@ std::optional<WorkflowStage> WorkflowPanel::draw(
             } else if (stage == WorkflowStage::SurfaceFit) {
                 ImGui::TextUnformatted("Fit local surface trends and generate seed normals");
             } else if (stage == WorkflowStage::NormalField) {
-                ImGui::TextUnformatted("Adjust and inspect the surface normal trend");
+                ImGui::TextUnformatted("Pick and review local normal flip points");
             } else if (stage == WorkflowStage::WeightPainting) {
                 ImGui::TextUnformatted("Paint and save surface weight fields");
             } else if (stage == WorkflowStage::Reconstruction) {

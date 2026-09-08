@@ -22,11 +22,52 @@ enum class SurfaceNormalNeighborhood : std::uint8_t {
     Grid5x5,
 };
 
+struct SurfaceNormalExpansionTrace;
+
 struct SurfaceNormalFitSettings
 {
-    SurfaceFitNeighborhood neighborhood = SurfaceFitNeighborhood::Grid3x3;
+    SurfaceFitNeighborhood neighborhood = SurfaceFitNeighborhood::Grid9x9;
     std::size_t robustIterations = 2;
     double isoValue = 255.0;
+};
+
+// Retained for compatibility with historical diagnostics only. The viewer
+// runtime uses explicit local flip points instead of automatic sign-island repair.
+struct SurfaceNormalFitSignRepairSettings
+{
+    double maximumIslandAreaSquareMillimeters = 25.0;
+    double minimumOpposingBoundaryFraction = 0.80;
+    double minimumHostAreaRatio = 4.0;
+    double minimumAlignment = 0.75;
+    double minimumRegionConnectivity = 0.35;
+    double minimumRepairEnergyMargin = 0.25;
+    std::size_t minimumOpposingBoundaryEdges = 8;
+    double maximumSurfaceNormalComponent = 0.75;
+    std::size_t maximumProtectedSeedDepth = 2;
+};
+
+struct SurfaceNormalFitSignRepairPatch
+{
+    std::size_t representativeSampleIndex = static_cast<std::size_t>(-1);
+    std::size_t hostRepresentativeSampleIndex = static_cast<std::size_t>(-1);
+    std::size_t sampleCount = 0;
+    double areaSquareMillimeters = 0.0;
+    double hostAreaSquareMillimeters = 0.0;
+    double opposingBoundaryFraction = 0.0;
+    double weightedOpposingBoundarySupport = 0.0;
+};
+
+struct SurfaceNormalFitSignRepairReport
+{
+    std::size_t validCoreEdgeCount = 0;
+    std::size_t candidateIslandCount = 0;
+    std::size_t acceptedIslandCount = 0;
+    std::size_t flippedCoreSampleCount = 0;
+    std::size_t reorientedTransitionSampleCount = 0;
+    double meanPointAxisConfidence = 0.0;
+    double weightedOpposingSupportBefore = 0.0;
+    double weightedOpposingSupportAfter = 0.0;
+    std::vector<SurfaceNormalFitSignRepairPatch> acceptedPatches;
 };
 
 struct SurfaceNormalSmoothingSettings
@@ -125,9 +166,23 @@ struct SurfaceNormalField
     [[nodiscard]] bool empty() const noexcept { return normals.empty(); }
 };
 
+struct SurfaceNormalFitSignRepairResult
+{
+    SurfaceNormalField field;
+    SurfaceNormalFitSignRepairReport report;
+};
+
 SurfaceNormalField fitSurfaceTargetNormals(
     const SurfaceTargetCache& target,
     const SurfaceNormalFitSettings& settings = {});
+
+// Historical API; do not call from the active viewer pipeline.
+SurfaceNormalFitSignRepairResult repairSurfaceNormalFitSignIslands(
+    const openvdb::FloatGrid& grid,
+    const SurfaceTargetCache& target,
+    const SurfaceNormalField& rawAxes,
+    const SurfaceNormalFitSignRepairSettings& settings = {},
+    const SurfaceNormalExpansionTrace* orientationTrace = nullptr);
 
 SurfaceNormalField fitSurfaceTargetNormals(
     // The grid overload is retained for callers that already have a grid;

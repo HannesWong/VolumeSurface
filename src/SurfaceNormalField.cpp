@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "volume_surface/SurfaceNormalLocalSeed.h"
+
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
@@ -598,6 +600,477 @@ SurfaceNormalField fitSurfaceTargetNormals(
     const SurfaceNormalFitSettings& settings)
 {
     return fitSurfaceTargetNormalsImpl(target, settings, &grid);
+}
+
+SurfaceNormalFitSignRepairResult repairSurfaceNormalFitSignIslands(
+    const openvdb::FloatGrid& grid,
+    const SurfaceTargetCache& target,
+    const SurfaceNormalField& rawAxes,
+    const SurfaceNormalFitSignRepairSettings& settings,
+    const SurfaceNormalExpansionTrace* orientationTrace)
+{
+    if (rawAxes.normals.size() != target.samples.size()) {
+        throw std::invalid_argument("surface normal fit repair field size does not match target");
+    }
+    if (!std::isfinite(settings.maximumIslandAreaSquareMillimeters) ||
+        settings.maximumIslandAreaSquareMillimeters < 0.0 ||
+        !std::isfinite(settings.minimumOpposingBoundaryFraction) ||
+        settings.minimumOpposingBoundaryFraction < 0.0 ||
+        settings.minimumOpposingBoundaryFraction > 1.0 ||
+        !std::isfinite(settings.minimumHostAreaRatio) ||
+        settings.minimumHostAreaRatio < 1.0 ||
+        !std::isfinite(settings.minimumAlignment) ||
+        settings.minimumAlignment < 0.0 || settings.minimumAlignment > 1.0 ||
+        !std::isfinite(settings.minimumRegionConnectivity) ||
+        settings.minimumRegionConnectivity < 0.0 ||
+        settings.minimumRegionConnectivity > 1.0 ||
+        !std::isfinite(settings.minimumRepairEnergyMargin) ||
+        settings.minimumRepairEnergyMargin < 0.0 ||
+        settings.minimumRepairEnergyMargin > 1.0 ||
+        settings.minimumOpposingBoundaryEdges == 0 ||
+        !std::isfinite(settings.maximumSurfaceNormalComponent) ||
+        settings.maximumSurfaceNormalComponent < 0.0 ||
+        settings.maximumSurfaceNormalComponent > 1.0) {
+        throw std::invalid_argument("surface normal fit repair settings are invalid");
+    }
+
+    SurfaceNormalFitSignRepairResult result;
+    result.field = rawAxes;
+    if (target.empty()) {
+        return result;
+    }
+
+    std::vector<std::size_t> coreSampleIndices;
+    std::unordered_map<openvdb::Coord, std::size_t, CoordHasher> coreIndices;
+    collectCoreIndices(target, coreSampleIndices, coreIndices);
+    if (coreSampleIndices.empty()) {
+        return result;
+    }
+
+    struct CoreEdge
+    {
+        std::uint32_t firstOrdinal = 0;
+        std::uint32_t secondOrdinal = 0;
+    };
+
+    struct DisjointSet
+    {
+        explicit DisjointSet(const std::size_t count)
+            : parent(count), rank(count, 0)
+        {
+            for (std::size_t index = 0; index < count; ++index) {
+                parent[index] = static_cast<std::uint32_t>(index);
+            }
+        }
+
+        std::uint32_t find(std::uint32_t value)
+        {
+            std::uint32_t root = value;
+            while (parent[root] != root) {
+                root = parent[root];
+            }
+            while (parent[value] != value) {
+                const std::uint32_t next = parent[value];
+                parent[value] = root;
+                value = next;
+            }
+            return root;
+        }
+
+        void unite(std::uint32_t first, std::uint32_t second)
+        {
+            first = find(first);
+            second = find(second);
+            if (first == second) {
+                return;
+            }
+            if (rank[first] < rank[second]) {
+                std::swap(first, second);
+            }
+            parent[second] = first;
+            if (rank[first] == rank[second]) {
+                ++rank[first];
+            }
+        }
+
+        std::vector<std::uint32_t> parent;
+        std::vector<std::uint8_t> rank;
+    };
+
+    struct Region
+    {
+        std::size_t representativeOrdinal = 0;
+        std::size_t sampleCount = 0;
+        double areaSquareMillimeters = 0.0;
+        double totalOpposingSupport = 0.0;
+        double strongestHostSupport = 0.0;
+        double strongestHostAgreeingSupport = 0.0;
+        std::size_t strongestHostBoundaryEdges = 0;
+        std::uint32_t strongestHost = std::numeric_limits<std::uint32_t>::max();
+    };
+
+    struct Evaluation
+    {
+        std::vector<double> pointAxisConfidence;
+        std::vector<std::uint32_t> regionByOrdinal;
+        std::vector<Region> regions;
+        double meanPointAxisConfidence = 0.0;
+        double weightedOpposingSupport = 0.0;
+    };
+
+    std::vector<std::int32_t> coreOrdinalBySample(
+        target.samples.size(),
+        static_cast<std::int32_t>(-1));
+    for (std::size_t ordinal = 0; ordinal < coreSampleIndices.size(); ++ordinal) {
+        coreOrdinalBySample[coreSampleIndices[ordinal]] = static_cast<std::int32_t>(ordinal);
+    }
+
+    std::vector<CoreEdge> edges;
+    edges.reserve(coreSampleIndices.size() * 6);
+    for (std::size_t firstOrdinal = 0; firstOrdinal < coreSampleIndices.size(); ++firstOrdinal) {
+        const std::size_t firstSampleIndex = coreSampleIndices[firstOrdinal];
+        const openvdb::Vec3d firstAxis = normalizeOrZero(
+            openvdb::Vec3d(rawAxes.normals[firstSampleIndex]));
+        if (firstAxis.lengthSqr() <= kEpsilon) {
+            continue;
+        }
+        const openvdb::Coord center = target.samples[firstSampleIndex].coordinate;
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx < 0 || (dx == 0 && dy < 0) ||
+                        (dx == 0 && dy == 0 && dz <= 0)) {
+                        continue;
+                    }
+                    const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
+                    if (found == coreIndices.end()) {
+                        continue;
+                    }
+                    const std::int32_t secondOrdinal = coreOrdinalBySample[found->second];
+                    if (secondOrdinal < 0) {
+                        continue;
+                    }
+                    const std::size_t secondSampleIndex = found->second;
+                    const openvdb::Vec3d secondAxis = normalizeOrZero(
+                        openvdb::Vec3d(rawAxes.normals[secondSampleIndex]));
+                    if (secondAxis.lengthSqr() <= kEpsilon ||
+                        !surfaceContinuationAllowed(
+                            target,
+                            firstSampleIndex,
+                            secondSampleIndex,
+                            firstAxis,
+                            secondAxis,
+                            settings.maximumSurfaceNormalComponent)) {
+                        continue;
+                    }
+                    edges.push_back({
+                        static_cast<std::uint32_t>(firstOrdinal),
+                        static_cast<std::uint32_t>(secondOrdinal)});
+                }
+            }
+        }
+    }
+    result.report.validCoreEdgeCount = edges.size();
+
+    const openvdb::Vec3d worldOrigin = grid.indexToWorld(openvdb::Vec3d(0.0));
+    const openvdb::Vec3d basisX =
+        grid.indexToWorld(openvdb::Vec3d(1.0, 0.0, 0.0)) - worldOrigin;
+    const openvdb::Vec3d basisY =
+        grid.indexToWorld(openvdb::Vec3d(0.0, 1.0, 0.0)) - worldOrigin;
+    const openvdb::Vec3d basisZ =
+        grid.indexToWorld(openvdb::Vec3d(0.0, 0.0, 1.0)) - worldOrigin;
+    const double voxelVolume = std::abs(basisX.dot(basisY.cross(basisZ)));
+    std::vector<double> sampleAreaSquareMillimeters(coreSampleIndices.size(), 0.0);
+    for (std::size_t ordinal = 0; ordinal < coreSampleIndices.size(); ++ordinal) {
+        const openvdb::Vec3d axis = normalizeOrZero(
+            openvdb::Vec3d(rawAxes.normals[coreSampleIndices[ordinal]]));
+        const double width = std::abs(axis.dot(basisX)) +
+            std::abs(axis.dot(basisY)) + std::abs(axis.dot(basisZ));
+        if (voxelVolume > kEpsilon && width > kEpsilon) {
+            sampleAreaSquareMillimeters[ordinal] = voxelVolume / width * 1.0e6;
+        }
+    }
+
+    const auto evaluate = [&]() {
+        Evaluation evaluation;
+        const std::size_t coreCount = coreSampleIndices.size();
+        std::vector<double> axisConfidenceSum(coreCount, 0.0);
+        std::vector<double> axisConfidenceWeight(coreCount, 0.0);
+        for (const CoreEdge& edge : edges) {
+            const double signedAlignment = std::clamp(
+                openvdb::Vec3d(result.field.normals[coreSampleIndices[edge.firstOrdinal]]).dot(
+                    openvdb::Vec3d(result.field.normals[coreSampleIndices[edge.secondOrdinal]])),
+                -1.0,
+                1.0);
+            const double alignment = std::abs(signedAlignment);
+            axisConfidenceSum[edge.firstOrdinal] += alignment;
+            axisConfidenceSum[edge.secondOrdinal] += alignment;
+            axisConfidenceWeight[edge.firstOrdinal] += 1.0;
+            axisConfidenceWeight[edge.secondOrdinal] += 1.0;
+        }
+        evaluation.pointAxisConfidence.resize(coreCount, 0.0);
+        for (std::size_t ordinal = 0; ordinal < coreCount; ++ordinal) {
+            if (axisConfidenceWeight[ordinal] <= kEpsilon) {
+                continue;
+            }
+            evaluation.pointAxisConfidence[ordinal] = std::clamp(
+                axisConfidenceSum[ordinal] / axisConfidenceWeight[ordinal],
+                0.0,
+                1.0);
+            evaluation.meanPointAxisConfidence += evaluation.pointAxisConfidence[ordinal];
+        }
+        evaluation.meanPointAxisConfidence /= static_cast<double>(coreCount);
+
+        DisjointSet components(coreCount);
+        for (const CoreEdge& edge : edges) {
+            const double signedAlignment = std::clamp(
+                openvdb::Vec3d(result.field.normals[coreSampleIndices[edge.firstOrdinal]]).dot(
+                    openvdb::Vec3d(result.field.normals[coreSampleIndices[edge.secondOrdinal]])),
+                -1.0,
+                1.0);
+            const double reliability = std::sqrt(
+                evaluation.pointAxisConfidence[edge.firstOrdinal] *
+                evaluation.pointAxisConfidence[edge.secondOrdinal]);
+            const double unsignedSupport = std::abs(signedAlignment) * reliability;
+            const bool strongOpposition = signedAlignment < 0.0 &&
+                unsignedSupport >= settings.minimumAlignment;
+            if (unsignedSupport >= settings.minimumRegionConnectivity &&
+                !strongOpposition) {
+                components.unite(edge.firstOrdinal, edge.secondOrdinal);
+            }
+        }
+
+        evaluation.regionByOrdinal.resize(coreCount);
+        std::unordered_map<std::uint32_t, std::uint32_t> regionByRoot;
+        regionByRoot.reserve(coreCount);
+        for (std::size_t ordinal = 0; ordinal < coreCount; ++ordinal) {
+            const std::uint32_t root = components.find(static_cast<std::uint32_t>(ordinal));
+            const auto [iterator, inserted] = regionByRoot.emplace(
+                root,
+                static_cast<std::uint32_t>(evaluation.regions.size()));
+            if (inserted) {
+                evaluation.regions.push_back({ordinal});
+            }
+            const std::uint32_t regionIndex = iterator->second;
+            evaluation.regionByOrdinal[ordinal] = regionIndex;
+            Region& region = evaluation.regions[regionIndex];
+            ++region.sampleCount;
+            region.areaSquareMillimeters += sampleAreaSquareMillimeters[ordinal];
+        }
+
+        struct BoundarySupport
+        {
+            double opposing = 0.0;
+            double agreeing = 0.0;
+            std::size_t opposingEdgeCount = 0;
+        };
+        std::unordered_map<std::uint64_t, BoundarySupport> boundarySupport;
+        boundarySupport.reserve(edges.size() / 4 + 1);
+        const auto pairKey = [](std::uint32_t first, std::uint32_t second) {
+            if (first > second) {
+                std::swap(first, second);
+            }
+            return (static_cast<std::uint64_t>(first) << 32U) |
+                static_cast<std::uint64_t>(second);
+        };
+        for (const CoreEdge& edge : edges) {
+            const double signedAlignment = std::clamp(
+                openvdb::Vec3d(result.field.normals[coreSampleIndices[edge.firstOrdinal]]).dot(
+                    openvdb::Vec3d(result.field.normals[coreSampleIndices[edge.secondOrdinal]])),
+                -1.0,
+                1.0);
+            const double reliability = std::sqrt(
+                evaluation.pointAxisConfidence[edge.firstOrdinal] *
+                evaluation.pointAxisConfidence[edge.secondOrdinal]);
+            const std::uint32_t firstRegion = evaluation.regionByOrdinal[edge.firstOrdinal];
+            const std::uint32_t secondRegion = evaluation.regionByOrdinal[edge.secondOrdinal];
+            if (firstRegion == secondRegion) {
+                continue;
+            }
+            const double support = std::abs(signedAlignment) * reliability;
+            const auto key = pairKey(firstRegion, secondRegion);
+            auto& pairSupport = boundarySupport[key];
+            if (signedAlignment < 0.0) {
+                pairSupport.opposing += support;
+                ++pairSupport.opposingEdgeCount;
+                evaluation.weightedOpposingSupport += support;
+            } else {
+                pairSupport.agreeing += support;
+            }
+        }
+        for (const auto& [key, support] : boundarySupport) {
+            const std::uint32_t firstRegion = static_cast<std::uint32_t>(key >> 32U);
+            const std::uint32_t secondRegion = static_cast<std::uint32_t>(key);
+            Region& first = evaluation.regions[firstRegion];
+            Region& second = evaluation.regions[secondRegion];
+            first.totalOpposingSupport += support.opposing;
+            second.totalOpposingSupport += support.opposing;
+            if (support.opposing > first.strongestHostSupport) {
+                first.strongestHostSupport = support.opposing;
+                first.strongestHostAgreeingSupport = support.agreeing;
+                first.strongestHostBoundaryEdges = support.opposingEdgeCount;
+                first.strongestHost = secondRegion;
+            }
+            if (support.opposing > second.strongestHostSupport) {
+                second.strongestHostSupport = support.opposing;
+                second.strongestHostAgreeingSupport = support.agreeing;
+                second.strongestHostBoundaryEdges = support.opposingEdgeCount;
+                second.strongestHost = firstRegion;
+            }
+        }
+        return evaluation;
+    };
+
+    struct Candidate
+    {
+        std::uint32_t region = 0;
+        std::uint32_t host = 0;
+        double boundaryFraction = 0.0;
+        double energyMargin = 0.0;
+    };
+
+    const Evaluation evaluation = evaluate();
+    result.report.meanPointAxisConfidence = evaluation.meanPointAxisConfidence;
+    result.report.weightedOpposingSupportBefore = evaluation.weightedOpposingSupport;
+
+    const auto protectedBySeedPath = [&](std::uint32_t regionIndex) {
+        if (!orientationTrace ||
+            !orientationTrace->matchesSampleCount(target.samples.size())) {
+            return false;
+        }
+        const Region& region = evaluation.regions[regionIndex];
+        for (std::size_t ordinal = 0;
+             ordinal < evaluation.regionByOrdinal.size();
+             ++ordinal) {
+            if (evaluation.regionByOrdinal[ordinal] != regionIndex) {
+                continue;
+            }
+            const std::size_t sampleIndex = coreSampleIndices[ordinal];
+            if (!orientationTrace->orientedBySample[sampleIndex]) {
+                return true;
+            }
+            const std::int32_t depth = orientationTrace->depthBySample[sampleIndex];
+            if (depth >= 0 &&
+                static_cast<std::size_t>(depth) <= settings.maximumProtectedSeedDepth) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(evaluation.regions.size() / 8 + 1);
+    for (std::uint32_t regionIndex = 0;
+         regionIndex < evaluation.regions.size();
+         ++regionIndex) {
+        const Region& region = evaluation.regions[regionIndex];
+        if (region.areaSquareMillimeters <= 0.0 ||
+            region.areaSquareMillimeters > settings.maximumIslandAreaSquareMillimeters ||
+            region.strongestHost == std::numeric_limits<std::uint32_t>::max() ||
+            region.totalOpposingSupport <= kEpsilon ||
+            region.strongestHostBoundaryEdges < settings.minimumOpposingBoundaryEdges ||
+            protectedBySeedPath(regionIndex)) {
+            continue;
+        }
+        const Region& host = evaluation.regions[region.strongestHost];
+        const double boundarySupport =
+            region.strongestHostSupport + region.strongestHostAgreeingSupport;
+        if (boundarySupport <= kEpsilon ||
+            host.areaSquareMillimeters <
+                region.areaSquareMillimeters * settings.minimumHostAreaRatio) {
+            continue;
+        }
+        const double boundaryFraction =
+            region.strongestHostSupport / boundarySupport;
+        const double energyMargin =
+            (region.strongestHostSupport - region.strongestHostAgreeingSupport) /
+            boundarySupport;
+        if (boundaryFraction < settings.minimumOpposingBoundaryFraction ||
+            energyMargin < settings.minimumRepairEnergyMargin) {
+            continue;
+        }
+        candidates.push_back({
+            regionIndex,
+            region.strongestHost,
+            boundaryFraction,
+            energyMargin});
+    }
+    result.report.candidateIslandCount = candidates.size();
+
+    std::vector<std::uint8_t> candidateFlags(evaluation.regions.size(), 0);
+    for (const Candidate& candidate : candidates) {
+        candidateFlags[candidate.region] = 1;
+    }
+    for (const Candidate& candidate : candidates) {
+        if (candidateFlags[candidate.host]) {
+            continue;
+        }
+        const Region& region = evaluation.regions[candidate.region];
+        const Region& host = evaluation.regions[candidate.host];
+        for (std::size_t ordinal = 0; ordinal < evaluation.regionByOrdinal.size(); ++ordinal) {
+            if (evaluation.regionByOrdinal[ordinal] != candidate.region) {
+                continue;
+            }
+            const std::size_t sampleIndex = coreSampleIndices[ordinal];
+            result.field.normals[sampleIndex] *= -1.0f;
+            ++result.report.flippedCoreSampleCount;
+        }
+        result.report.acceptedPatches.push_back({
+            coreSampleIndices[region.representativeOrdinal],
+            coreSampleIndices[host.representativeOrdinal],
+            region.sampleCount,
+            region.areaSquareMillimeters,
+            host.areaSquareMillimeters,
+            candidate.boundaryFraction,
+            region.strongestHostSupport});
+        ++result.report.acceptedIslandCount;
+    }
+
+    const Evaluation finalEvaluation = evaluate();
+    result.report.meanPointAxisConfidence = finalEvaluation.meanPointAxisConfidence;
+    result.report.weightedOpposingSupportAfter = finalEvaluation.weightedOpposingSupport;
+
+    for (std::size_t sampleIndex = 0; sampleIndex < target.samples.size(); ++sampleIndex) {
+        if (target.samples[sampleIndex].kind != SurfaceTargetSampleKind::Transition) {
+            continue;
+        }
+        const openvdb::Vec3d axis = normalizeOrZero(
+            openvdb::Vec3d(rawAxes.normals[sampleIndex]));
+        if (axis.lengthSqr() <= kEpsilon) {
+            continue;
+        }
+        const openvdb::Coord center = target.samples[sampleIndex].coordinate;
+        openvdb::Vec3d coreDirection(0.0);
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
+                    if (found == coreIndices.end()) {
+                        continue;
+                    }
+                    const openvdb::Vec3d coreAxis = normalizeOrZero(
+                        openvdb::Vec3d(result.field.normals[found->second]));
+                    if (coreAxis.lengthSqr() <= kEpsilon ||
+                        !surfaceContinuationAllowed(
+                            target,
+                            sampleIndex,
+                            found->second,
+                            axis,
+                            coreAxis,
+                            settings.maximumSurfaceNormalComponent)) {
+                        continue;
+                    }
+                    coreDirection += coreAxis;
+                }
+            }
+        }
+        if (coreDirection.lengthSqr() <= kEpsilon || axis.dot(coreDirection) >= 0.0) {
+            continue;
+        }
+        result.field.normals[sampleIndex] *= -1.0f;
+        ++result.report.reorientedTransitionSampleCount;
+    }
+    return result;
 }
 
 SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
@@ -1769,6 +2242,272 @@ SurfaceNormalAdjacencyStatistics analyzeSurfaceTargetNormalAdjacency(
                     }
                 }
             }
+        }
+    }
+    return result;
+}
+
+SurfaceNormalLocalFlipPointPreview previewSurfaceNormalLocalFlipPoint(
+    const SurfaceTargetCache& target,
+    const SurfaceNormalField& fittedAxes,
+    const SurfaceNormalField& globalOrientedField,
+    std::size_t flipPointSampleIndex,
+    const SurfaceNormalLocalFlipPointSettings& settings,
+    const SurfaceNormalExpansionTrace* orientationTrace)
+{
+    SurfaceNormalLocalFlipPointPreview result;
+    if (target.empty() || fittedAxes.normals.size() != target.samples.size() ||
+        globalOrientedField.normals.size() != target.samples.size() ||
+        flipPointSampleIndex >= target.samples.size() ||
+        target.samples[flipPointSampleIndex].kind != SurfaceTargetSampleKind::Core ||
+        settings.maximumCoreSamples == 0 ||
+        !std::isfinite(settings.maximumDistanceMillimeters) ||
+        settings.maximumDistanceMillimeters < 0.0 ||
+        !std::isfinite(settings.minimumAxisAlignment) ||
+        settings.minimumAxisAlignment < 0.0 ||
+        settings.minimumAxisAlignment > 1.0 ||
+        !std::isfinite(settings.maximumSurfaceNormalComponent) ||
+        settings.maximumSurfaceNormalComponent < 0.0 ||
+        settings.maximumSurfaceNormalComponent > 1.0) {
+        return result;
+    }
+
+    std::vector<std::size_t> coreSampleIndices;
+    std::unordered_map<openvdb::Coord, std::size_t, CoordHasher> coreIndices;
+    collectCoreIndices(target, coreSampleIndices, coreIndices);
+    if (coreIndices.find(target.samples[flipPointSampleIndex].coordinate) == coreIndices.end()) {
+        return result;
+    }
+
+    const openvdb::Vec3d flipPointAxis = normalizeOrZero(
+        openvdb::Vec3d(fittedAxes.normals[flipPointSampleIndex]));
+    const openvdb::Vec3d flipPointCurrent = normalizeOrZero(
+        openvdb::Vec3d(globalOrientedField.normals[flipPointSampleIndex]));
+    if (flipPointAxis.lengthSqr() <= kEpsilon ||
+        flipPointCurrent.lengthSqr() <= kEpsilon) {
+        return result;
+    }
+
+    const openvdb::Vec3d seedPosition(
+        target.samples[flipPointSampleIndex].worldPosition);
+    result.seedSampleIndex = flipPointSampleIndex;
+    result.flipPointSampleIndex = flipPointSampleIndex;
+    result.parentBySample.assign(target.samples.size(), -1);
+    result.depthBySample.assign(target.samples.size(), -1);
+    std::vector<std::uint8_t> visited(target.samples.size(), 0);
+    std::vector<std::uint8_t> boundarySeen(target.samples.size(), 0);
+    const bool directedPropagation = orientationTrace &&
+        orientationTrace->matchesSampleCount(target.samples.size());
+    enum class BoundaryReason {
+        InvalidNormal,
+        SurfaceContinuation,
+        AxisAlignment,
+        Distance,
+        AlreadyAligned,
+    };
+    struct Pending {
+        std::size_t sampleIndex = 0;
+        // This is the actual direction after this point is flipped. It is
+        // intentionally carried through the chain instead of being rebuilt
+        // from the unsigned fitted axis.
+        openvdb::Vec3d postFlipNormal{};
+    };
+    std::vector<Pending> queue;
+    queue.reserve(std::min(settings.maximumCoreSamples, coreSampleIndices.size()));
+
+    // The selected point is a forced flip event, not an orientation seed.
+    // Every subsequent point is admitted only when its current direction is
+    // opposite to the already-flipped parent direction.
+    const openvdb::Vec3d flipPointPostNormal = -flipPointCurrent;
+    queue.push_back({flipPointSampleIndex, flipPointPostNormal});
+    visited[flipPointSampleIndex] = 1;
+    result.depthBySample[flipPointSampleIndex] = 0;
+    result.affectedCoreSampleIndices.push_back(flipPointSampleIndex);
+
+    auto appendBoundary = [&](std::size_t sampleIndex, BoundaryReason reason) {
+        if (sampleIndex < boundarySeen.size() && !boundarySeen[sampleIndex]) {
+            boundarySeen[sampleIndex] = 1;
+            result.boundaryCoreSampleIndices.push_back(sampleIndex);
+            switch (reason) {
+                case BoundaryReason::InvalidNormal:
+                    ++result.invalidNormalBoundaryCount;
+                    break;
+                case BoundaryReason::SurfaceContinuation:
+                    ++result.surfaceContinuationBoundaryCount;
+                    break;
+                case BoundaryReason::AxisAlignment:
+                    ++result.axisAlignmentBoundaryCount;
+                    break;
+                case BoundaryReason::Distance:
+                    ++result.distanceBoundaryCount;
+                    break;
+                case BoundaryReason::AlreadyAligned:
+                    ++result.alreadyAlignedBoundaryCount;
+                    break;
+            }
+        }
+    };
+
+    std::size_t queueCursor = 0;
+    while (queueCursor < queue.size() &&
+           result.affectedCoreSampleIndices.size() < settings.maximumCoreSamples) {
+        const Pending current = queue[queueCursor++];
+        const openvdb::Coord center = target.samples[current.sampleIndex].coordinate;
+        const std::int32_t currentDepth = result.depthBySample[current.sampleIndex];
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
+                    if (found == coreIndices.end()) {
+                        continue;
+                    }
+                    const std::size_t neighborIndex = found->second;
+                    if (directedPropagation &&
+                        orientationTrace->parentBySample[neighborIndex] !=
+                            static_cast<std::int32_t>(current.sampleIndex)) {
+                        continue;
+                    }
+                    if (visited[neighborIndex]) {
+                        continue;
+                    }
+                    const openvdb::Vec3d neighborAxis = normalizeOrZero(
+                        openvdb::Vec3d(fittedAxes.normals[neighborIndex]));
+                    const openvdb::Vec3d neighborCurrent = normalizeOrZero(
+                        openvdb::Vec3d(globalOrientedField.normals[neighborIndex]));
+                    if (neighborAxis.lengthSqr() <= kEpsilon ||
+                        neighborCurrent.lengthSqr() <= kEpsilon) {
+                        appendBoundary(neighborIndex, BoundaryReason::InvalidNormal);
+                        continue;
+                    }
+                    if (!surfaceContinuationAllowed(
+                            target,
+                            current.sampleIndex,
+                            neighborIndex,
+                            current.postFlipNormal,
+                            neighborCurrent,
+                            settings.maximumSurfaceNormalComponent)) {
+                        appendBoundary(neighborIndex, BoundaryReason::SurfaceContinuation);
+                        continue;
+                    }
+                    const double axisAlignment = std::abs(
+                        current.postFlipNormal.dot(neighborCurrent));
+                    if (axisAlignment < settings.minimumAxisAlignment) {
+                        appendBoundary(neighborIndex, BoundaryReason::AxisAlignment);
+                        continue;
+                    }
+                    const openvdb::Vec3d displacement = openvdb::Vec3d(
+                        target.samples[neighborIndex].worldPosition) - seedPosition;
+                    const double distanceMillimeters = displacement.length() * 1000.0;
+                    if (settings.maximumDistanceMillimeters > 0.0 &&
+                        distanceMillimeters > settings.maximumDistanceMillimeters) {
+                        appendBoundary(neighborIndex, BoundaryReason::Distance);
+                        continue;
+                    }
+                    const double signedAlignment =
+                        current.postFlipNormal.dot(neighborCurrent);
+                    if (signedAlignment >= settings.minimumAxisAlignment) {
+                        appendBoundary(neighborIndex, BoundaryReason::AlreadyAligned);
+                        continue;
+                    }
+                    if (signedAlignment > -settings.minimumAxisAlignment) {
+                        appendBoundary(neighborIndex, BoundaryReason::AxisAlignment);
+                        continue;
+                    }
+                    visited[neighborIndex] = 1;
+                    result.parentBySample[neighborIndex] =
+                        static_cast<std::int32_t>(current.sampleIndex);
+                    result.depthBySample[neighborIndex] = currentDepth + 1;
+                    result.affectedCoreSampleIndices.push_back(neighborIndex);
+                    queue.push_back({
+                        neighborIndex,
+                        -neighborCurrent});
+                    result.maximumDepth = std::max(
+                        result.maximumDepth,
+                        currentDepth + 1);
+                    result.maximumDistanceMillimeters = std::max(
+                        result.maximumDistanceMillimeters,
+                        distanceMillimeters);
+                    if (result.affectedCoreSampleIndices.size() >=
+                        settings.maximumCoreSamples) {
+                        break;
+                    }
+                }
+                if (result.affectedCoreSampleIndices.size() >= settings.maximumCoreSamples) {
+                    break;
+                }
+            }
+            if (result.affectedCoreSampleIndices.size() >= settings.maximumCoreSamples) {
+                break;
+            }
+        }
+    }
+
+    result.valid = !result.affectedCoreSampleIndices.empty();
+    result.affectedCoreSampleCount = result.affectedCoreSampleIndices.size();
+    result.boundaryCoreSampleCount = result.boundaryCoreSampleIndices.size();
+    result.maximumCoreSamplesReached =
+        result.affectedCoreSampleCount >= settings.maximumCoreSamples &&
+        queueCursor < queue.size();
+    if (result.maximumDepth < 0) {
+        result.maximumDepth = 0;
+    }
+    return result;
+}
+
+SurfaceNormalField applySurfaceNormalLocalFlipPoint(
+    const SurfaceTargetCache& target,
+    const SurfaceNormalField& baseField,
+    const SurfaceNormalLocalFlipPointPreview& preview)
+{
+    // A capped preview is intentionally non-committable. Applying a partial
+    // chain would create a new artificial boundary at the sample limit.
+    if (baseField.normals.size() != target.samples.size() ||
+        !preview.valid || preview.maximumCoreSamplesReached) {
+        return baseField;
+    }
+    SurfaceNormalField result = baseField;
+    std::vector<std::uint8_t> flipped(target.samples.size(), 0);
+    for (const std::size_t sampleIndex : preview.affectedCoreSampleIndices) {
+        if (sampleIndex >= result.normals.size() ||
+            target.samples[sampleIndex].kind != SurfaceTargetSampleKind::Core) {
+            continue;
+        }
+        result.normals[sampleIndex] *= -1.0f;
+        flipped[sampleIndex] = 1;
+    }
+
+    std::unordered_map<openvdb::Coord, std::size_t, CoordHasher> coreIndices;
+    coreIndices.reserve(target.coreCount * 2 + 1);
+    for (std::size_t sampleIndex = 0; sampleIndex < target.samples.size(); ++sampleIndex) {
+        if (target.samples[sampleIndex].kind == SurfaceTargetSampleKind::Core) {
+            coreIndices.emplace(target.samples[sampleIndex].coordinate, sampleIndex);
+        }
+    }
+    for (std::size_t sampleIndex = 0; sampleIndex < target.samples.size(); ++sampleIndex) {
+        if (target.samples[sampleIndex].kind != SurfaceTargetSampleKind::Transition) {
+            continue;
+        }
+        const openvdb::Coord center = target.samples[sampleIndex].coordinate;
+        std::size_t totalCoreNeighbors = 0;
+        std::size_t flippedCoreNeighbors = 0;
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
+                    if (found == coreIndices.end()) {
+                        continue;
+                    }
+                    const std::size_t neighborIndex = found->second;
+                    ++totalCoreNeighbors;
+                    flippedCoreNeighbors += flipped[neighborIndex] ? 1 : 0;
+                }
+            }
+        }
+        if (totalCoreNeighbors > 0 && flippedCoreNeighbors * 2 >= totalCoreNeighbors) {
+            result.normals[sampleIndex] *= -1.0f;
         }
     }
     return result;

@@ -3,12 +3,14 @@
 #include "volume_surface/SurfaceMesh.h"
 #include "volume_surface/SurfaceReconstruction.h"
 #include "volume_surface/SurfaceTarget.h"
+#include "volume_surface/SurfaceNormalLocalSeed.h"
 #include "volume_surface/SurfaceTargetPreview.h"
 #include "volume_surface/viewer/BrushProfileRecorder.h"
 #include "volume_surface/viewer/MeshRenderer.h"
 #include "volume_surface/viewer/PresentationController.h"
 #include "volume_surface/viewer/SliceRenderer.h"
 #include "volume_surface/viewer/SurfaceTargetCacheRepository.h"
+#include "volume_surface/viewer/SurfaceNormalLocalSeedStore.h"
 #include "volume_surface/viewer/ViewerContext.h"
 #include "volume_surface/viewer/ViewerState.h"
 #include "volume_surface/viewer/WorkflowController.h"
@@ -72,6 +74,12 @@ using WorkflowPanel = volume_surface::viewer::WorkflowPanel;
 using SurfaceFitPlaneRenderer = volume_surface::viewer::SurfaceFitPlaneRenderer;
 using SurfaceFitExpansionDebugRenderer =
     volume_surface::viewer::SurfaceFitExpansionDebugRenderer;
+using SurfaceNormalLocalSeedRenderer =
+    volume_surface::viewer::SurfaceNormalLocalSeedRenderer;
+using SurfaceNormalLocalSeedStore =
+    volume_surface::viewer::SurfaceNormalLocalSeedStore;
+using SurfaceNormalLocalSeedRecord =
+    volume_surface::viewer::SurfaceNormalLocalSeedRecord;
 using SurfaceTargetPointPicker =
     volume_surface::viewer::SurfaceTargetPointPicker;
 using SurfaceNormalSeed = volume_surface::viewer::SurfaceNormalSeed;
@@ -87,6 +95,10 @@ using BrushProfileStroke = volume_surface::viewer::BrushProfileStroke;
 constexpr float kCameraNearMeters = 0.0001f;
 constexpr float kCameraFarMeters = 10.0f;
 
+bool surfaceTargetCoordinateLess(
+    const openvdb::Coord& left,
+    const openvdb::Coord& right);
+
 void applyWorkflowPresentation(ViewerState& state, Scene& scene);
 void setWorkflowStage(ViewerState& state, Scene& scene, WorkflowStage stage);
 bool rebuildSurfaceTargetCache(
@@ -96,6 +108,8 @@ bool saveSurfaceTargetCacheToDisk(ViewerState& state);
 bool loadSurfaceTargetCacheFromDisk(ViewerState& state);
 bool loadSurfaceNormalSeedFromDisk(ViewerState& state);
 bool saveSurfaceNormalSeedToDisk(ViewerState& state);
+bool loadLocalNormalSeedsFromDisk(ViewerState& state);
+bool saveLocalNormalSeedsToDisk(ViewerState& state);
 void processOrientationSeedPick(
     ViewerState& state,
     const View& view);
@@ -113,6 +127,23 @@ void processSurfaceFitExpansionPick(
     Engine& engine,
     Scene& scene,
     const View& view);
+void processLocalNormalSeedPick(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene,
+    const View& view);
+bool addLocalFlipPointAtSample(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene,
+    std::size_t sampleIndex,
+    double pickDistanceMillimeters = 0.0);
+void rebuildLocalNormalSeedDebug(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene);
+void replayLocalNormalSeeds(ViewerState& state);
+void updateLocalNormalSeedPreview(ViewerState& state);
 void rebuildSurfaceFitExpansionDebug(
     ViewerState& state,
     Engine& engine,
@@ -121,6 +152,7 @@ void rebuildPickedSurfaceFitPlane(
     ViewerState& state,
     Engine& engine,
     Scene& scene);
+void clearLocalNormalSeedPreview(ViewerState& state);
 
 void clearSurfaceFitExpansionSelection(ViewerState& state)
 {
@@ -130,6 +162,24 @@ void clearSurfaceFitExpansionSelection(ViewerState& state)
     state.surfaceFitExpansionParentDepthThreshold = 0;
     state.surfaceFitExpansionDebugRenderer.settings().showNeighborhood = false;
     state.surfaceFitExpansionStatus = "No debug Core point selected";
+}
+
+void clearSurfaceNormalFitResult(ViewerState& state)
+{
+    state.normalFitReady = false;
+    state.normalFitField = {};
+    state.primaryOrientedNormalField = {};
+    state.normalFitAdjacencyStatistics = {};
+    clearLocalNormalSeedPreview(state);
+}
+
+void clearLocalNormalSeedPreview(ViewerState& state)
+{
+    state.localNormalSeedPreview = {};
+    state.localNormalSeedSelected = std::numeric_limits<std::size_t>::max();
+    state.localNormalSeedPickArmed = false;
+    state.localNormalSeedPickRequested = false;
+    state.localNormalSeedStatus = "No local flip point selected";
 }
 
 bool hasUsableNormalField(const ViewerState& state)
@@ -147,6 +197,13 @@ bool hasUsableOrientedNormalField(const ViewerState& state)
             state.surfaceTargetCache->samples.size();
 }
 
+bool hasUsablePrimaryOrientedNormalField(const ViewerState& state)
+{
+    return state.surfaceTargetCache &&
+        state.primaryOrientedNormalField.normals.size() ==
+            state.surfaceTargetCache->samples.size();
+}
+
 const char* normalFitNeighborhoodName(const ViewerState& state)
 {
     switch (state.normalFitSettings.neighborhood) {
@@ -157,7 +214,7 @@ const char* normalFitNeighborhoodName(const ViewerState& state)
         case volume_surface::SurfaceFitNeighborhood::Grid3x3:
             return "3x3";
     }
-    return "3x3";
+    return "9x9";
 }
 
 std::size_t normalFitNeighborhoodSide(const ViewerState& state)
@@ -170,7 +227,7 @@ std::size_t normalFitNeighborhoodSide(const ViewerState& state)
         case volume_surface::SurfaceFitNeighborhood::Grid3x3:
             return 3;
     }
-    return 3;
+    return 9;
 }
 
 const char* normalTrendNeighborhoodName(const ViewerState& state)
@@ -188,14 +245,16 @@ const char* normalTrendNeighborhoodName(const ViewerState& state)
 
 std::string reconstructionNormalSourceName(const ViewerState& state)
 {
-    if (hasUsableOrientedNormalField(state)) {
-        return std::string("seed_oriented_") + normalFitNeighborhoodName(state) +
-            "+surface_normal_" + normalTrendNeighborhoodName(state);
-    }
+    const std::string localSeedSuffix = state.localNormalSeeds.empty()
+        ? std::string{}
+        : std::string("+local_flip_points");
     return hasUsableNormalField(state)
         ? std::string("surface_fit_") + normalFitNeighborhoodName(state) +
-            "+surface_normal_" + normalTrendNeighborhoodName(state)
-        : std::string("surface_target_seed");
+            localSeedSuffix + "+surface_normal_" + normalTrendNeighborhoodName(state)
+        : hasUsableOrientedNormalField(state)
+            ? std::string("seed_oriented_") + normalFitNeighborhoodName(state)
+                + "+local_flip_points"
+            : std::string("surface_target_seed");
 }
 
 bool buildCameraPickRay(
@@ -308,8 +367,12 @@ public:
                 const bool orientationSeedPick = mState->orientationSeedPickArmed &&
                     mState->workflowController.stage() == WorkflowStage::SurfaceFit;
                 const bool expansionDebugPick = mState->surfaceFitExpansionPickArmed &&
-                    mState->workflowController.stage() == WorkflowStage::SurfaceFit;
-                if ((surfaceFitPick || orientationSeedPick || expansionDebugPick) &&
+                    (mState->workflowController.stage() == WorkflowStage::SurfaceFit ||
+                        mState->workflowController.stage() == WorkflowStage::NormalField);
+                const bool localNormalSeedPick = mState->localNormalSeedPickArmed &&
+                    mState->workflowController.stage() == WorkflowStage::NormalField;
+                if ((surfaceFitPick || orientationSeedPick || expansionDebugPick ||
+                     localNormalSeedPick) &&
                     !mState->brushControlDown &&
                     !pointerOverUi &&
                     event.mouseButton.button == 1) {
@@ -323,11 +386,16 @@ public:
                         mState->orientationSeedPickX = event.mouseButton.x;
                         mState->orientationSeedPickY = event.mouseButton.y;
                         mState->orientationSeedPickArmed = false;
-                    } else {
+                    } else if (expansionDebugPick) {
                         mState->surfaceFitExpansionPickRequested = true;
                         mState->surfaceFitExpansionPickX = event.mouseButton.x;
                         mState->surfaceFitExpansionPickY = event.mouseButton.y;
                         mState->surfaceFitExpansionPickArmed = false;
+                    } else {
+                        mState->localNormalSeedPickRequested = true;
+                        mState->localNormalSeedPickX = event.mouseButton.x;
+                        mState->localNormalSeedPickY = event.mouseButton.y;
+                        mState->localNormalSeedPickArmed = false;
                     }
                     mCameraGrabActive = false;
                     event.type = filament::app::AppEvent::Type::TEXTINPUT;
@@ -1055,7 +1123,11 @@ void applyWorkflowPresentation(ViewerState& state, Scene& scene)
         presentationState);
     state.surfaceFitExpansionDebugRenderer.setVisible(
         scene,
-        state.workflowController.stage() == WorkflowStage::SurfaceFit);
+        state.workflowController.stage() == WorkflowStage::SurfaceFit ||
+            state.workflowController.stage() == WorkflowStage::NormalField);
+    state.surfaceNormalLocalSeedRenderer.setVisible(
+        scene,
+        state.workflowController.stage() == WorkflowStage::NormalField);
     if (!showHeatmap) {
         state.brushCursorVisible = false;
     }
@@ -1074,6 +1146,10 @@ void setWorkflowStage(ViewerState& state, Scene& scene, WorkflowStage stage)
     if (stage != WorkflowStage::SurfaceFit) {
         state.orientationSeedPickArmed = false;
         state.orientationSeedPickRequested = false;
+    }
+    if (stage != WorkflowStage::NormalField) {
+        state.localNormalSeedPickArmed = false;
+        state.localNormalSeedPickRequested = false;
     }
     state.normalFieldPreviewActive = stage == WorkflowStage::NormalField;
     state.normalFitPreviewActive = stage == WorkflowStage::SurfaceFit;
@@ -1256,6 +1332,246 @@ volume_surface::SurfaceTargetCacheMetadata surfaceTargetCacheMetadata(
         state.surfaceTargetSettings);
 }
 
+std::filesystem::path surfaceNormalLocalSeedPathForInput(
+    const ViewerState& state)
+{
+    return SurfaceNormalLocalSeedStore::pathForInput(state.input, state.gridName);
+}
+
+bool findSurfaceTargetCoreSample(
+    const volume_surface::SurfaceTargetCache& cache,
+    const openvdb::Coord& coordinate,
+    std::size_t& sampleIndex)
+{
+    const auto iterator = std::lower_bound(
+        cache.samples.begin(),
+        cache.samples.end(),
+        coordinate,
+        [](const volume_surface::SurfaceTargetSample& sample,
+           const openvdb::Coord& value) {
+            return surfaceTargetCoordinateLess(sample.coordinate, value);
+        });
+    if (iterator == cache.samples.end() ||
+        iterator->coordinate != coordinate ||
+        iterator->kind != volume_surface::SurfaceTargetSampleKind::Core) {
+        return false;
+    }
+    sampleIndex = static_cast<std::size_t>(iterator - cache.samples.begin());
+    return true;
+}
+
+std::array<std::uint8_t, 4> localFlipPointColorForOrdinal(
+    std::size_t ordinal)
+{
+    static constexpr std::array<std::array<std::uint8_t, 4>, 10> palette{{
+        {255, 82, 82, 255},
+        {82, 166, 255, 255},
+        {255, 190, 64, 255},
+        {132, 232, 116, 255},
+        {216, 112, 255, 255},
+        {64, 226, 210, 255},
+        {255, 126, 200, 255},
+        {166, 142, 255, 255},
+        {255, 132, 56, 255},
+        {126, 236, 232, 255}}};
+    return palette[ordinal % palette.size()];
+}
+
+openvdb::Vec3d localFlipPointScenePosition(
+    const ViewerState& state,
+    std::size_t sampleIndex)
+{
+    if (!state.surfaceTargetCache ||
+        sampleIndex >= state.surfaceTargetCache->samples.size()) {
+        return openvdb::Vec3d{
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::quiet_NaN()};
+    }
+    const auto& worldPosition =
+        state.surfaceTargetCache->samples[sampleIndex].worldPosition;
+    return openvdb::Vec3d{
+        (worldPosition.x() - static_cast<double>(state.referenceCenter.x)) *
+            static_cast<double>(state.displayScale),
+        (worldPosition.y() - static_cast<double>(state.referenceCenter.y)) *
+            static_cast<double>(state.displayScale),
+        (worldPosition.z() - static_cast<double>(state.referenceCenter.z)) *
+            static_cast<double>(state.displayScale) - 4.0};
+}
+
+openvdb::Vec3d worldToScenePosition(
+    const ViewerState& state,
+    const openvdb::Vec3d& worldPosition)
+{
+    return openvdb::Vec3d{
+        (worldPosition.x() - static_cast<double>(state.referenceCenter.x)) *
+            static_cast<double>(state.displayScale),
+        (worldPosition.y() - static_cast<double>(state.referenceCenter.y)) *
+            static_cast<double>(state.displayScale),
+        (worldPosition.z() - static_cast<double>(state.referenceCenter.z)) *
+            static_cast<double>(state.displayScale) - 4.0};
+}
+
+void focusCameraOnLocalFlipPoint(
+    ViewerState& state,
+    std::size_t sampleIndex)
+{
+    const openvdb::Vec3d scenePosition =
+        localFlipPointScenePosition(state, sampleIndex);
+    if (!std::isfinite(scenePosition.x()) ||
+        !std::isfinite(scenePosition.y()) ||
+        !std::isfinite(scenePosition.z())) {
+        return;
+    }
+    state.surfaceAwareCameraController.focusOn(scenePosition);
+    if (state.context.view) {
+        state.surfaceAwareCameraController.applyTo(
+            state.context.view->getCamera());
+    }
+}
+
+void focusCameraOnWorldPosition(
+    ViewerState& state,
+    const openvdb::Vec3d& worldPosition)
+{
+    const openvdb::Vec3d scenePosition =
+        worldToScenePosition(state, worldPosition);
+    if (!std::isfinite(scenePosition.x()) ||
+        !std::isfinite(scenePosition.y()) ||
+        !std::isfinite(scenePosition.z())) {
+        return;
+    }
+    state.surfaceAwareCameraController.focusOn(scenePosition);
+    if (state.context.view) {
+        state.surfaceAwareCameraController.applyTo(
+            state.context.view->getCamera());
+    }
+}
+
+bool loadLocalNormalSeedsFromDisk(ViewerState& state)
+{
+    state.localNormalSeedPath = surfaceNormalLocalSeedPathForInput(state);
+    state.localNormalSeeds.clear();
+    if (!state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
+        state.localNormalSeedCacheStatus = "Local flip-point cache requires a SurfaceTarget cache";
+        return false;
+    }
+
+    std::vector<SurfaceNormalLocalSeedRecord> records;
+    std::string error;
+    if (!SurfaceNormalLocalSeedStore::load(
+            state.localNormalSeedPath,
+            surfaceTargetCacheMetadata(state),
+            records,
+            error)) {
+        state.localNormalSeedCacheStatus = error.empty()
+            ? "No saved local flip-point cache"
+            : "Local flip-point cache load skipped: " + error;
+        return false;
+    }
+
+    std::size_t ignoredCount = 0;
+    std::size_t inactiveLegacyCount = 0;
+    bool normalizedAcceptedState = false;
+    for (const auto& record : records) {
+        std::size_t sampleIndex = std::numeric_limits<std::size_t>::max();
+        if (!findSurfaceTargetCoreSample(
+                *state.surfaceTargetCache,
+                record.coordinate,
+                sampleIndex)) {
+            ++ignoredCount;
+            continue;
+        }
+        const bool duplicate = std::find_if(
+            state.localNormalSeeds.begin(),
+            state.localNormalSeeds.end(),
+            [&](const ViewerState::LocalNormalSeedEntry& entry) {
+                return entry.coordinate == record.coordinate;
+            }) != state.localNormalSeeds.end();
+        if (duplicate) {
+            ++ignoredCount;
+            continue;
+        }
+        ViewerState::LocalNormalSeedEntry entry;
+        entry.sampleIndex = sampleIndex;
+        entry.coordinate = record.coordinate;
+        entry.targetSign = record.targetSign;
+        entry.activeFlipPoint = record.activeFlipPoint;
+        entry.color = record.hasColor
+            ? record.color
+            : localFlipPointColorForOrdinal(state.localNormalSeeds.size());
+        // Legacy seed records are kept visible for cleanup, but are never
+        // replayed as flip points without an explicit new Accept action.
+        // An active flip-point record is immediately executable. The
+        // accepted field remains readable for old cache files but no longer
+        // blocks replay after Add.
+        entry.accepted = record.activeFlipPoint;
+        normalizedAcceptedState = normalizedAcceptedState ||
+            (record.activeFlipPoint && record.hasAccepted && !record.accepted);
+        if (!entry.activeFlipPoint) {
+            ++inactiveLegacyCount;
+        }
+        state.localNormalSeeds.push_back(entry);
+    }
+    if (normalizedAcceptedState) {
+        saveLocalNormalSeedsToDisk(state);
+    }
+    state.localNormalSeedSelected = state.localNormalSeeds.empty()
+        ? std::numeric_limits<std::size_t>::max()
+        : state.localNormalSeeds.size() - 1;
+    state.localNormalSeedCacheStatus =
+        "Loaded " + std::to_string(state.localNormalSeeds.size()) +
+        " local flip point(s)" +
+        (inactiveLegacyCount == 0
+            ? std::string()
+            : " (" + std::to_string(inactiveLegacyCount) +
+                " legacy point(s) inactive)") +
+        (ignoredCount == 0
+            ? std::string()
+            : " (ignored " + std::to_string(ignoredCount) + " stale/duplicate)");
+    state.localNormalSeedStatus = state.localNormalSeeds.empty()
+        ? "No local flip point selected"
+        : inactiveLegacyCount == state.localNormalSeeds.size()
+            ? "Loaded legacy local points; none will be replayed as flip points"
+            : "Loaded local flip points; build Surface Fit to replay them";
+    return true;
+}
+
+bool saveLocalNormalSeedsToDisk(ViewerState& state)
+{
+    if (!state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
+        state.localNormalSeedCacheStatus =
+            "No SurfaceTarget cache is available for local flip points";
+        return false;
+    }
+    state.localNormalSeedPath = surfaceNormalLocalSeedPathForInput(state);
+    std::vector<SurfaceNormalLocalSeedRecord> records;
+    records.reserve(state.localNormalSeeds.size());
+    for (const auto& entry : state.localNormalSeeds) {
+        records.push_back({
+            entry.coordinate,
+            entry.targetSign,
+            entry.activeFlipPoint,
+            entry.color,
+            true,
+            entry.accepted,
+            true});
+    }
+    std::string error;
+    if (!SurfaceNormalLocalSeedStore::save(
+            state.localNormalSeedPath,
+            records,
+            surfaceTargetCacheMetadata(state),
+            error)) {
+        state.localNormalSeedCacheStatus = "Local flip-point cache save failed: " + error;
+        return false;
+    }
+    state.localNormalSeedCacheStatus =
+        "Saved " + std::to_string(records.size()) + " local flip point(s) to " +
+        state.localNormalSeedPath.filename().string();
+    return true;
+}
+
 bool saveSurfaceTargetCacheToDisk(ViewerState& state)
 {
     if (!state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
@@ -1301,8 +1617,8 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
     state.surfaceTargetCache = std::make_shared<volume_surface::SurfaceTargetCache>(
         std::move(loaded));
     clearSurfaceFitExpansionSelection(state);
-    state.normalFitReady = false;
-    state.normalFitField = {};
+    state.localNormalSeeds.clear();
+    clearSurfaceNormalFitResult(state);
     state.normalFitStatus = "Fitted normal seeds have not been built for this cache";
     state.normalFieldReady = false;
     state.normalField = {};
@@ -1310,7 +1626,6 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
     state.orientedNormalFieldReady = false;
     state.orientedNormalField = {};
     state.orientedNormalExpansionTrace = {};
-    state.normalFitAdjacencyStatistics = {};
     state.orientedNormalAdjacencyStatistics = {};
     state.orientedNormalStatus = "Orientation seed must be reapplied for this cache";
     state.normalFieldPreviewDirty = true;
@@ -1328,6 +1643,7 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
         " core / " +
         std::to_string(state.surfaceTargetCache->transitionCount) +
         " transition samples";
+    loadLocalNormalSeedsFromDisk(state);
     loadSurfaceNormalSeedFromDisk(state);
     state.sliceDirty = true;
     return true;
@@ -1365,8 +1681,8 @@ bool rebuildSurfaceTargetCache(
                 std::chrono::steady_clock::now() - start).count();
         state.surfaceTargetCache = std::move(cache);
         clearSurfaceFitExpansionSelection(state);
-        state.normalFitReady = false;
-        state.normalFitField = {};
+        state.localNormalSeeds.clear();
+        clearSurfaceNormalFitResult(state);
         state.normalFitStatus = "Fitted normal seeds have not been built for this cache";
         state.normalFieldReady = false;
         state.normalField = {};
@@ -1374,7 +1690,6 @@ bool rebuildSurfaceTargetCache(
         state.orientedNormalFieldReady = false;
         state.orientedNormalField = {};
         state.orientedNormalExpansionTrace = {};
-        state.normalFitAdjacencyStatistics = {};
         state.orientedNormalAdjacencyStatistics = {};
         state.orientedNormalStatus = "Orientation seed must be reapplied for this cache";
         state.normalFieldPreviewDirty = true;
@@ -1388,8 +1703,9 @@ bool rebuildSurfaceTargetCache(
             "Surface target ready: " +
             std::to_string(state.surfaceTargetCache->coreCount) +
             " core / " +
-            std::to_string(state.surfaceTargetCache->transitionCount) +
-            " transition samples";
+        std::to_string(state.surfaceTargetCache->transitionCount) +
+        " transition samples";
+        loadLocalNormalSeedsFromDisk(state);
         loadSurfaceNormalSeedFromDisk(state);
         state.sliceDirty = true;
         saveSurfaceTargetCacheToDisk(state);
@@ -1400,8 +1716,8 @@ bool rebuildSurfaceTargetCache(
                 std::chrono::steady_clock::now() - start).count();
         state.surfaceTargetCache.reset();
         clearSurfaceFitExpansionSelection(state);
-        state.normalFitReady = false;
-        state.normalFitField = {};
+        state.localNormalSeeds.clear();
+        clearSurfaceNormalFitResult(state);
         state.normalFitStatus = "Fitted normal seeds are unavailable";
         state.normalFieldReady = false;
         state.normalField = {};
@@ -1409,7 +1725,6 @@ bool rebuildSurfaceTargetCache(
         state.orientedNormalFieldReady = false;
         state.orientedNormalField = {};
         state.orientedNormalExpansionTrace = {};
-        state.normalFitAdjacencyStatistics = {};
         state.orientedNormalAdjacencyStatistics = {};
         state.orientedNormalStatus = "Orientation seed is unavailable";
         state.normalFieldPreviewDirty = true;
@@ -1433,12 +1748,10 @@ bool rebuildSurfaceNormalFit(ViewerState& state)
     state.orientedNormalFieldReady = false;
     state.orientedNormalField = {};
     state.orientedNormalExpansionTrace = {};
-    state.normalFitAdjacencyStatistics = {};
+    clearSurfaceNormalFitResult(state);
     state.orientedNormalAdjacencyStatistics = {};
     state.orientedNormalStatus = "Orientation seed must be reapplied after fitting";
     if (!state.grid || !state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
-        state.normalFitReady = false;
-        state.normalFitField = {};
         state.normalFitStatus = "Surface fit requires the source grid and SurfaceTarget cache";
         return false;
     }
@@ -1467,7 +1780,7 @@ bool rebuildSurfaceNormalFit(ViewerState& state)
                 " core / " +
                 std::to_string(state.normalFitField.smoothedTransitionCount) +
                 " transition samples (" +
-                std::to_string(elapsedMilliseconds) + " ms)"
+                std::to_string(elapsedMilliseconds) + " ms; initial seed is pending)"
             : "Surface fit produced no valid normals";
         state.normalFieldReady = false;
         state.normalField = {};
@@ -1475,9 +1788,7 @@ bool rebuildSurfaceNormalFit(ViewerState& state)
         state.normalFieldPreviewDirty = true;
         return state.normalFitReady;
     } catch (const std::exception& error) {
-        state.normalFitReady = false;
-        state.normalFitField = {};
-        state.normalFitAdjacencyStatistics = {};
+        clearSurfaceNormalFitResult(state);
         state.orientedNormalAdjacencyStatistics = {};
         state.normalFitStatus = std::string("Surface fit failed: ") + error.what();
         state.normalFieldReady = false;
@@ -1491,11 +1802,6 @@ bool rebuildSurfaceNormalFit(ViewerState& state)
 bool rebuildSurfaceNormalField(ViewerState& state)
 {
     clearSurfaceFitExpansionSelection(state);
-    state.orientedNormalFieldReady = false;
-    state.orientedNormalField = {};
-    state.orientedNormalExpansionTrace = {};
-    state.orientedNormalAdjacencyStatistics = {};
-    state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
     if (!state.surfaceTargetCache || state.surfaceTargetCache->empty()) {
         state.normalFieldReady = false;
         state.normalField = {};
@@ -1509,12 +1815,22 @@ bool rebuildSurfaceNormalField(ViewerState& state)
         state.normalFieldStatus = "Build Surface Fit / Normal Seed first";
         return false;
     }
+    if (!hasUsableOrientedNormalField(state)) {
+        state.normalFieldReady = false;
+        state.normalField = {};
+        state.normalFieldStatus = "Apply the global seed in Surface Fit first";
+        return false;
+    }
 
     try {
         const auto start = std::chrono::steady_clock::now();
+        const volume_surface::SurfaceNormalField& smoothingInput =
+            hasUsableOrientedNormalField(state)
+                ? state.orientedNormalField
+                : state.normalFitField;
         state.normalField = volume_surface::smoothSurfaceTargetNormals(
             *state.surfaceTargetCache,
-            state.normalFitField,
+            smoothingInput,
             state.normalSmoothingSettings);
         state.normalFieldReady = !state.normalField.empty();
         const double elapsedMilliseconds =
@@ -1528,6 +1844,15 @@ bool rebuildSurfaceNormalField(ViewerState& state)
                 " averaged transition samples (" +
                 std::to_string(elapsedMilliseconds) + " ms)"
             : "Normal field produced no valid normals";
+        state.orientedNormalFieldReady = hasUsableOrientedNormalField(state);
+        state.orientedNormalAdjacencyStatistics = state.orientedNormalFieldReady
+            ? volume_surface::analyzeSurfaceTargetNormalAdjacency(
+                *state.surfaceTargetCache,
+                state.orientedNormalField)
+            : volume_surface::SurfaceNormalAdjacencyStatistics{};
+        state.orientedNormalStatus = state.orientedNormalFieldReady
+            ? "Global seed and local flip points remain active"
+            : "Initial global seed must be applied before local flip points";
         state.normalFieldPreviewDirty = true;
         return state.normalFieldReady;
     } catch (const std::exception& error) {
@@ -1580,7 +1905,7 @@ bool rebuildOrientedNormalField(ViewerState& state)
     }
 
     try {
-        state.orientedNormalField = volume_surface::orientSurfaceTargetNormals(
+        state.primaryOrientedNormalField = volume_surface::orientSurfaceTargetNormals(
             *state.surfaceTargetCache,
             *baseField,
             seedSampleIndex,
@@ -1590,8 +1915,9 @@ bool rebuildOrientedNormalField(ViewerState& state)
         state.normalFitAdjacencyStatistics =
             volume_surface::analyzeSurfaceTargetNormalAdjacency(
                 *state.surfaceTargetCache,
-                *baseField,
+                state.primaryOrientedNormalField,
                 seedSampleIndex);
+        state.orientedNormalField = state.primaryOrientedNormalField;
         state.orientedNormalFieldReady = !state.orientedNormalField.empty();
         if (state.orientedNormalFieldReady) {
             state.orientedNormalAdjacencyStatistics =
@@ -1600,8 +1926,17 @@ bool rebuildOrientedNormalField(ViewerState& state)
                     state.orientedNormalField,
                     seedSampleIndex);
         }
+        const bool canReplayLocalSeeds =
+            state.normalFitField.normals.size() == state.surfaceTargetCache->samples.size();
+        if (canReplayLocalSeeds && !state.localNormalSeeds.empty()) {
+            replayLocalNormalSeeds(state);
+        }
         state.orientedNormalStatus = state.orientedNormalFieldReady
-            ? "Seed orientation applied: " +
+            ? "Initial global seed applied" +
+                (state.localNormalSeeds.empty()
+                    ? std::string()
+                    : " + " + std::to_string(state.localNormalSeeds.size()) +
+                        " local flip point(s)") + ": " +
                 std::to_string(state.orientedNormalField.smoothedCoreCount) +
                 " core / " +
                 std::to_string(state.orientedNormalField.smoothedTransitionCount) +
@@ -1614,6 +1949,131 @@ bool rebuildOrientedNormalField(ViewerState& state)
             std::string("Seed orientation failed: ") + error.what();
         return false;
     }
+}
+
+void replayLocalNormalSeeds(ViewerState& state)
+{
+    if (!state.surfaceTargetCache || state.primaryOrientedNormalField.empty()) {
+        state.orientedNormalField = {};
+        state.orientedNormalFieldReady = false;
+        state.localNormalSeedStatus = "Global seed must be applied before local flip points";
+        return;
+    }
+    state.orientedNormalField = state.primaryOrientedNormalField;
+    std::size_t cappedCount = 0;
+    for (const auto& entry : state.localNormalSeeds) {
+        if (!entry.accepted ||
+            !entry.activeFlipPoint ||
+            entry.sampleIndex >= state.surfaceTargetCache->samples.size()) {
+            continue;
+        }
+        const auto preview = volume_surface::previewSurfaceNormalLocalSeed(
+            *state.surfaceTargetCache,
+            state.normalFitField,
+            state.orientedNormalField,
+            entry.sampleIndex,
+            state.localNormalSeedSettings,
+            &state.orientedNormalExpansionTrace);
+        if (!preview.valid || preview.maximumCoreSamplesReached) {
+            if (preview.maximumCoreSamplesReached) {
+                ++cappedCount;
+            }
+            continue;
+        }
+        state.orientedNormalField = volume_surface::applySurfaceNormalLocalSeed(
+            *state.surfaceTargetCache,
+            state.orientedNormalField,
+            preview);
+    }
+    state.orientedNormalFieldReady = !state.orientedNormalField.empty();
+    state.orientedNormalAdjacencyStatistics = state.orientedNormalFieldReady
+        ? volume_surface::analyzeSurfaceTargetNormalAdjacency(
+            *state.surfaceTargetCache,
+            state.orientedNormalField)
+        : volume_surface::SurfaceNormalAdjacencyStatistics{};
+    state.normalFieldReady = false;
+    state.normalField = {};
+    state.normalFieldStatus = "Local flip points updated; smoothing is deferred to a later stage";
+    state.localNormalSeedStatus = cappedCount == 0
+        ? "Accepted flip points replayed from the global baseline"
+        : std::to_string(cappedCount) +
+            " flip point(s) skipped because their preview hit the sample limit";
+    state.normalFieldPreviewDirty = true;
+}
+
+void updateLocalNormalSeedPreview(ViewerState& state)
+{
+    if (!state.surfaceTargetCache ||
+        !hasUsablePrimaryOrientedNormalField(state) ||
+        state.localNormalSeedSelected >= state.localNormalSeeds.size()) {
+        clearLocalNormalSeedPreview(state);
+        return;
+    }
+    const auto& entry = state.localNormalSeeds[state.localNormalSeedSelected];
+    if (!entry.activeFlipPoint || entry.accepted ||
+        entry.sampleIndex >= state.surfaceTargetCache->samples.size()) {
+        state.localNormalSeedPreview = {};
+        return;
+    }
+    const auto& baseField = hasUsableOrientedNormalField(state)
+        ? state.orientedNormalField
+        : state.primaryOrientedNormalField;
+    state.localNormalSeedPreview = volume_surface::previewSurfaceNormalLocalSeed(
+        *state.surfaceTargetCache,
+        state.normalFitField,
+        baseField,
+        entry.sampleIndex,
+        state.localNormalSeedSettings,
+        &state.orientedNormalExpansionTrace);
+}
+
+void rebuildLocalNormalSeedDebug(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene)
+{
+    std::vector<SurfaceNormalLocalSeedRenderer::FlipPoint> points;
+    if (state.surfaceTargetCache) {
+        points.reserve(state.localNormalSeeds.size());
+        for (const auto& entry : state.localNormalSeeds) {
+            if (entry.sampleIndex >= state.surfaceTargetCache->samples.size()) {
+                continue;
+            }
+            points.push_back({
+                openvdb::Vec3d(
+                    state.surfaceTargetCache->samples[entry.sampleIndex].worldPosition),
+                entry.color,
+                entry.activeFlipPoint});
+        }
+    }
+    if (state.surfaceNormalSeed.valid) {
+        points.push_back({
+            state.surfaceNormalSeed.worldPosition,
+            {255, 255, 255, 255},
+            true});
+    }
+    SurfaceNormalLocalSeedRenderer::FlipPointInputs inputs;
+    inputs.points = &points;
+    inputs.referenceCenter = openvdb::Vec3d{
+        state.referenceCenter.x,
+        state.referenceCenter.y,
+        state.referenceCenter.z};
+    inputs.displayScale = state.displayScale;
+    inputs.sourcePointScale = state.surfaceTargetPreview.settings().pointScale;
+    const openvdb::Vec3d voxelSize = state.grid
+        ? state.grid->voxelSize()
+        : openvdb::Vec3d{1.0, 1.0, 1.0};
+    inputs.minimumVoxelSize = static_cast<float>(std::max({
+        std::abs(voxelSize.x()),
+        std::abs(voxelSize.y()),
+        std::abs(voxelSize.z())}));
+    state.surfaceNormalLocalSeedRenderer.rebuildFlipPoints(
+        engine,
+        scene,
+        inputs);
+    state.surfaceNormalLocalSeedRenderer.setVisible(
+        scene,
+        state.workflowController.stage() == WorkflowStage::NormalField);
 }
 
 void rebuildSurfaceTargetPreview(ViewerState& state, Engine& engine, Scene& scene)
@@ -1639,11 +2099,11 @@ void rebuildSurfaceTargetPreview(ViewerState& state, Engine& engine, Scene& scen
                 : &state.normalFitField.normals;
         } else if (state.normalFieldPreviewActive &&
                    state.normalFieldPreviewSmoothed) {
-            if (hasUsableOrientedNormalField(state)) {
-                inputs.normalOverrides = &state.orientedNormalField.normals;
-            } else if (state.normalFieldReady &&
+            if (state.normalFieldReady &&
                        state.normalField.normals.size() == state.surfaceTargetCache->samples.size()) {
                 inputs.normalOverrides = &state.normalField.normals;
+            } else if (hasUsableOrientedNormalField(state)) {
+                inputs.normalOverrides = &state.orientedNormalField.normals;
             }
         }
     }
@@ -1659,6 +2119,7 @@ void rebuildSurfaceTargetPreview(ViewerState& state, Engine& engine, Scene& scen
     pickerInputs.includeCore = true;
     state.surfaceTargetPointPicker.rebuild(engine, pickerInputs);
     rebuildSurfaceFitExpansionDebug(state, engine, scene);
+    rebuildLocalNormalSeedDebug(state, engine, scene);
     state.normalFieldPreviewDirty = false;
     applyWorkflowPresentation(state, scene);
 }
@@ -1712,7 +2173,8 @@ void rebuildSurfaceFitExpansionDebug(
     state.surfaceFitExpansionDebugRenderer.rebuild(engine, scene, inputs);
     state.surfaceFitExpansionDebugRenderer.setVisible(
         scene,
-        state.workflowController.stage() == WorkflowStage::SurfaceFit);
+        state.workflowController.stage() == WorkflowStage::SurfaceFit ||
+            state.workflowController.stage() == WorkflowStage::NormalField);
 }
 
 void updateBrushCursorGeometry(
@@ -1785,6 +2247,7 @@ void rebuildReference(ViewerState& state, Engine& engine, Scene& scene)
         state.brushPaintingPanel.rebuildHeatmapFromWeightField(state, engine, scene);
         rebuildSurfaceTargetCache(state);
         rebuildSurfaceTargetPreview(state, engine, scene);
+        rebuildLocalNormalSeedDebug(state, engine, scene);
         applyWorkflowPresentation(state, scene);
         state.brushResult = {};
         state.brushStrokePathWorld.clear();
@@ -1810,10 +2273,10 @@ bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& sce
     state.reconstructionSettings.isoValue = state.isoValue;
     const auto start = std::chrono::steady_clock::now();
     try {
-        const auto* normalOverrides = hasUsableOrientedNormalField(state)
-            ? &state.orientedNormalField.normals
-            : hasUsableNormalField(state)
-                ? &state.normalField.normals
+        const auto* normalOverrides = hasUsableNormalField(state)
+            ? &state.normalField.normals
+            : hasUsableOrientedNormalField(state)
+                ? &state.orientedNormalField.normals
                 : nullptr;
         auto result = volume_surface::reconstructSurfaceMLS(
             *state.grid,
@@ -2017,14 +2480,14 @@ void rebuildPickedSurfaceFitPlane(
     inputs.normalWorld = report.targetSampleFound
         ? openvdb::Vec3d(report.targetSample.normal)
         : report.vdb.normal;
-    const auto& displayedNormals = hasUsableOrientedNormalField(state)
-        ? state.orientedNormalField.normals
-        : state.normalFitField.normals;
-    if (report.targetSampleIndex >= displayedNormals.size()) {
+    const auto* displayedNormals = hasUsableOrientedNormalField(state)
+        ? &state.orientedNormalField.normals
+        : &state.normalFitField.normals;
+    if (!displayedNormals || report.targetSampleIndex >= displayedNormals->size()) {
         state.surfaceFitPlaneRenderer.rebuild(engine, scene, {});
         return;
     }
-    inputs.normalWorld = openvdb::Vec3d(displayedNormals[report.targetSampleIndex]);
+    inputs.normalWorld = openvdb::Vec3d((*displayedNormals)[report.targetSampleIndex]);
     inputs.referenceCenter = openvdb::Vec3d{
         state.referenceCenter.x,
         state.referenceCenter.y,
@@ -2130,7 +2593,9 @@ void processSurfaceFitExpansionPick(
     if (!gpuResult.ready && !state.surfaceFitExpansionPickRequested) {
         return;
     }
-    if (state.workflowController.stage() != WorkflowStage::SurfaceFit ||
+    const WorkflowStage stage = state.workflowController.stage();
+    if ((stage != WorkflowStage::SurfaceFit &&
+         stage != WorkflowStage::NormalField) ||
         !state.grid || !state.surfaceTargetCache ||
         state.surfaceTargetCache->empty() ||
         !state.orientedNormalExpansionTrace.matchesSampleCount(
@@ -2339,6 +2804,166 @@ void processOrientationSeedPick(
         state.surfaceNormalSeedStatus =
             "Seed selected from outside ray and saved automatically";
     }
+}
+
+bool addLocalFlipPointAtSample(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene,
+    std::size_t sampleIndex,
+    double pickDistanceMillimeters)
+{
+    if (!state.surfaceTargetCache ||
+        sampleIndex >= state.surfaceTargetCache->samples.size() ||
+        state.surfaceTargetCache->samples[sampleIndex].kind !=
+            volume_surface::SurfaceTargetSampleKind::Core ||
+        !hasUsablePrimaryOrientedNormalField(state)) {
+        state.localNormalSeedStatus =
+            "A global Seed result is required before adding a flip point";
+        return false;
+    }
+
+    const auto& baseField = hasUsableOrientedNormalField(state)
+        ? state.orientedNormalField
+        : state.primaryOrientedNormalField;
+    auto preview = volume_surface::previewSurfaceNormalLocalFlipPoint(
+        *state.surfaceTargetCache,
+        state.normalFitField,
+        baseField,
+        sampleIndex,
+        state.localNormalSeedSettings,
+        &state.orientedNormalExpansionTrace);
+    if (!preview.valid) {
+        state.localNormalSeedStatus =
+            "The selected Core sample cannot produce a flip-point preview";
+        clearLocalNormalSeedPreview(state);
+        rebuildLocalNormalSeedDebug(state, engine, scene);
+        return false;
+    }
+
+    std::size_t entryIndex = std::numeric_limits<std::size_t>::max();
+    for (std::size_t index = 0; index < state.localNormalSeeds.size(); ++index) {
+        if (state.localNormalSeeds[index].sampleIndex == sampleIndex) {
+            entryIndex = index;
+            break;
+        }
+    }
+    if (entryIndex == std::numeric_limits<std::size_t>::max()) {
+        ViewerState::LocalNormalSeedEntry entry;
+        entry.sampleIndex = sampleIndex;
+        entry.coordinate = state.surfaceTargetCache->samples[sampleIndex].coordinate;
+        entry.targetSign = 1;
+        entry.accepted = true;
+        entry.activeFlipPoint = true;
+        entry.color = localFlipPointColorForOrdinal(
+            state.localNormalSeeds.size());
+        state.localNormalSeeds.push_back(entry);
+        entryIndex = state.localNormalSeeds.size() - 1;
+    } else {
+        auto& entry = state.localNormalSeeds[entryIndex];
+        if (entry.accepted && entry.activeFlipPoint) {
+            state.localNormalSeedSelected = entryIndex;
+            state.localNormalSeedPreview = {};
+            state.localNormalSeedStatus = "The selected point is already an accepted flip point";
+            rebuildLocalNormalSeedDebug(state, engine, scene);
+            return true;
+        }
+        entry.activeFlipPoint = true;
+        entry.accepted = true;
+    }
+    state.localNormalSeedSelected = entryIndex;
+    state.localNormalSeedPreview = std::move(preview);
+    state.localNormalSeedStatus =
+        "Flip point preview: " +
+        std::to_string(state.localNormalSeedPreview.affectedCoreSampleCount) +
+        " affected Core / " +
+        std::to_string(state.localNormalSeedPreview.boundaryCoreSampleCount) +
+        " boundary" +
+        (pickDistanceMillimeters > 0.0
+            ? " (" + std::to_string(pickDistanceMillimeters) + " mm pick distance)"
+            : std::string());
+    if (!saveLocalNormalSeedsToDisk(state)) {
+        state.localNormalSeedStatus += " (cache save failed)";
+    }
+    replayLocalNormalSeeds(state);
+    state.localNormalSeedStatus =
+        "Flip point added, enabled, and replayed from the global baseline";
+    rebuildLocalNormalSeedDebug(state, engine, scene);
+    state.normalFieldPreviewDirty = true;
+    return true;
+}
+
+void processLocalNormalSeedPick(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene,
+    const View& view)
+{
+    if (!state.localNormalSeedPickRequested) {
+        return;
+    }
+    state.localNormalSeedPickRequested = false;
+    state.localNormalSeedPickArmed = false;
+    if (state.workflowController.stage() != WorkflowStage::NormalField ||
+        !state.grid || !state.surfaceTargetCache ||
+        state.surfaceTargetCache->empty() ||
+        !hasUsablePrimaryOrientedNormalField(state)) {
+        state.localNormalSeedStatus =
+            "Local flip-point pick requires the global seed from Surface Fit";
+        return;
+    }
+
+    CameraPickRay ray;
+    if (!buildCameraPickRay(
+            view,
+            state.localNormalSeedPickX,
+            state.localNormalSeedPickY,
+            ray)) {
+        state.localNormalSeedStatus = "Unable to build the local flip-point pick ray";
+        return;
+    }
+    std::array<bool, 4> visibleSlots{};
+    for (std::size_t index = 0; index < visibleSlots.size(); ++index) {
+        visibleSlots[index] = state.slots[index].visible;
+    }
+    const CameraPickHit hit = state.cameraPickController.pick(ray, visibleSlots);
+    if (!hit.hit) {
+        state.localNormalSeedStatus = "No visible mesh was hit for the local flip point";
+        return;
+    }
+    const openvdb::Vec3d meshWorldPosition = state.context.coordinates.toWorld(
+        float3{
+            static_cast<float>(hit.scenePosition.x()),
+            static_cast<float>(hit.scenePosition.y()),
+            static_cast<float>(hit.scenePosition.z())});
+    volume_surface::VdbSurfaceProbeSettings probeSettings;
+    probeSettings.isoValue = state.isoValue;
+    const auto vdbSurface = volume_surface::projectVdbSurface(
+        *state.grid,
+        meshWorldPosition,
+        probeSettings);
+    const openvdb::Vec3d targetPosition = vdbSurface.valid
+        ? vdbSurface.worldPosition
+        : meshWorldPosition;
+    std::size_t sampleIndex = std::numeric_limits<std::size_t>::max();
+    double targetDistance = 0.0;
+    if (!findNearestCoreSurfaceTargetSample(
+            *state.surfaceTargetCache,
+            *state.grid,
+            targetPosition,
+            sampleIndex,
+            targetDistance)) {
+        state.localNormalSeedStatus =
+            "The picked point is not near a Core SurfaceTarget sample";
+        return;
+    }
+
+    addLocalFlipPointAtSample(
+        state,
+        engine,
+        scene,
+        sampleIndex,
+        targetDistance * 1000.0);
 }
 
 void drawSlotControls(ViewerState& state, Engine& engine, Scene& scene, std::size_t index)
@@ -2666,6 +3291,7 @@ void drawSurfaceTargetWindow(ViewerState& state, Engine& engine, Scene& scene)
     if (ImGui::Button("Rebuild surface target")) {
         rebuildSurfaceTargetCache(state, false);
         rebuildSurfaceTargetPreview(state, engine, scene);
+        rebuildLocalNormalSeedDebug(state, engine, scene);
     }
     ImGui::SameLine();
     ImGui::TextWrapped("%s", state.surfaceTargetStatus.c_str());
@@ -2676,6 +3302,7 @@ void drawSurfaceTargetWindow(ViewerState& state, Engine& engine, Scene& scene)
     if (ImGui::Button("Load cache")) {
         if (loadSurfaceTargetCacheFromDisk(state)) {
             rebuildSurfaceTargetPreview(state, engine, scene);
+            rebuildLocalNormalSeedDebug(state, engine, scene);
         }
     }
     ImGui::TextWrapped(
@@ -2716,6 +3343,20 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
     ImGui::Separator();
 
     auto& settings = state.normalFitSettings;
+    const auto invalidateFit = [&]() {
+        clearSurfaceFitExpansionSelection(state);
+        clearSurfaceNormalFitResult(state);
+        state.normalFieldReady = false;
+        state.normalField = {};
+        state.orientedNormalFieldReady = false;
+        state.orientedNormalField = {};
+        state.orientedNormalStatus = "Orientation seed must be reapplied after fitting";
+        state.normalFitStatus = "Surface fit settings changed; build the selected mode";
+        state.normalFieldStatus = "Normal field requires the updated fitted seed field";
+        state.normalFieldPreviewDirty = true;
+        rebuildPickedSurfaceFitPlane(state, engine, scene);
+        applyWorkflowPresentation(state, scene);
+    };
     const char* neighborhoodLabels[] = {"3 x 3", "5 x 5", "9 x 9"};
     int neighborhoodIndex = settings.neighborhood ==
             volume_surface::SurfaceFitNeighborhood::Grid5x5
@@ -2733,19 +3374,7 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
             : neighborhoodIndex == 1
                 ? volume_surface::SurfaceFitNeighborhood::Grid5x5
                 : volume_surface::SurfaceFitNeighborhood::Grid3x3;
-        clearSurfaceFitExpansionSelection(state);
-        state.normalFitReady = false;
-        state.normalFitField = {};
-        state.normalFieldReady = false;
-        state.normalField = {};
-        state.orientedNormalFieldReady = false;
-        state.orientedNormalField = {};
-        state.orientedNormalStatus = "Orientation seed must be reapplied after fitting";
-        state.normalFitStatus = "Surface fit settings changed; build the selected mode";
-        state.normalFieldStatus = "Normal field requires the updated fitted seed field";
-        state.normalFieldPreviewDirty = true;
-        rebuildPickedSurfaceFitPlane(state, engine, scene);
-        applyWorkflowPresentation(state, scene);
+        invalidateFit();
     }
     int robustIterations = static_cast<int>(std::clamp<std::size_t>(
         settings.robustIterations,
@@ -2753,19 +3382,7 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
         5));
     if (ImGui::SliderInt("Fit robust iterations", &robustIterations, 1, 5)) {
         settings.robustIterations = static_cast<std::size_t>(robustIterations);
-        clearSurfaceFitExpansionSelection(state);
-        state.normalFitReady = false;
-        state.normalFitField = {};
-        state.normalFieldReady = false;
-        state.normalField = {};
-        state.orientedNormalFieldReady = false;
-        state.orientedNormalField = {};
-        state.orientedNormalStatus = "Orientation seed must be reapplied after fitting";
-        state.normalFitStatus = "Surface fit settings changed; build the selected mode";
-        state.normalFieldStatus = "Normal field requires the updated fitted seed field";
-        state.normalFieldPreviewDirty = true;
-        rebuildPickedSurfaceFitPlane(state, engine, scene);
-        applyWorkflowPresentation(state, scene);
+        invalidateFit();
     }
     ImGui::Text(
         "Support: %s connected samples",
@@ -2886,6 +3503,7 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
     ImGui::SameLine();
     if (ImGui::Button("Load seed")) {
         loadSurfaceNormalSeedFromDisk(state);
+        rebuildLocalNormalSeedDebug(state, engine, scene);
     }
     ImGui::TextWrapped("Seed file: %s",
         state.surfaceNormalSeedPath.empty()
@@ -2961,144 +3579,37 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
     }
     ImGui::SameLine();
     ImGui::TextWrapped("%s", state.normalFitStatus.c_str());
-    bool previewChanged = ImGui::Checkbox(
-        "Show fitted normal vectors",
-        &state.surfaceTargetPreview.settings().showNormals);
+
+    bool previewChanged = false;
     previewChanged |= ImGui::Checkbox(
         "Show points",
         &state.surfaceTargetPreview.settings().showPoints);
     if (previewChanged) {
         state.normalFieldPreviewDirty = true;
     }
-    ImGui::Separator();
-    ImGui::TextUnformatted("26-neighborhood expansion debug");
-    if (ImGui::Button(
-            state.surfaceFitExpansionPickArmed
-                ? "Click a Core point"
-                : "\xE9\x80\x89\xE5\x8F\x96 debug point")) {
-        state.surfaceFitExpansionPickArmed = true;
-        state.reconstructionPickArmed = false;
-        state.orientationSeedPickArmed = false;
-        state.surfaceFitExpansionStatus = "Click a visible Core point in the viewer";
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("\xE6\xB8\x85\xE9\x99\xA4 pick")) {
-        clearSurfaceFitExpansionSelection(state);
-        rebuildSurfaceFitExpansionDebug(state, engine, scene);
-        applyWorkflowPresentation(state, scene);
-    }
-    const bool showUnifiedNeighborhood =
-        state.surfaceFitExpansionDebugRenderer.settings().showUnifiedNeighborhood;
-    const bool canToggleNeighborhoodColors =
-        state.surfaceFitExpansionNeighborhood.valid;
-    if (!canToggleNeighborhoodColors) {
-        ImGui::BeginDisabled();
-    }
-    if (ImGui::Button(
-        showUnifiedNeighborhood
-            ? "\xE6\x81\xA2\xE5\xA4\x8D\xE5\x88\x86\xE7\xBB\x84\xE9\xA2\x9C\xE8\x89\xB2"
-            : "\xE6\x98\xBE\xE7\xA4\xBA\xE7\xBB\x9F\xE4\xB8\x80\xE9\x82\xBB\xE5\x9F\x9F")) {
-        state.surfaceFitExpansionDebugRenderer.settings().showUnifiedNeighborhood =
-            !showUnifiedNeighborhood;
-        rebuildSurfaceFitExpansionDebug(state, engine, scene);
-        applyWorkflowPresentation(state, scene);
-    }
-    if (!canToggleNeighborhoodColors) {
-        ImGui::EndDisabled();
-    }
-    const bool showCurrentPointNormals =
-        state.surfaceFitExpansionDebugRenderer.settings().showCurrentPointNormals;
-    if (!canToggleNeighborhoodColors) {
-        ImGui::BeginDisabled();
-    }
-    if (ImGui::Button(
-            showCurrentPointNormals
-                ? "Hide current point normals"
-                : "Show current point normals")) {
-        state.surfaceFitExpansionDebugRenderer.settings().showCurrentPointNormals =
-            !showCurrentPointNormals;
-        rebuildSurfaceFitExpansionDebug(state, engine, scene);
-        applyWorkflowPresentation(state, scene);
-    }
-    if (!canToggleNeighborhoodColors) {
-        ImGui::EndDisabled();
-    }
-    ImGui::TextWrapped("%s", state.surfaceFitExpansionStatus.c_str());
-    const auto& expansionNeighborhood = state.surfaceFitExpansionNeighborhood;
-    if (expansionNeighborhood.valid && state.surfaceTargetCache) {
-        const int maximumParentDepth = std::max(0, expansionNeighborhood.targetDepth);
-        int parentDepthThreshold = std::clamp(
-            state.surfaceFitExpansionParentDepthThreshold,
-            0,
-            maximumParentDepth);
-        if (maximumParentDepth > 0) {
-            if (ImGui::SliderInt(
-                    "Parent depth >=",
-                    &parentDepthThreshold,
-                    0,
-                    maximumParentDepth,
-                    "%d")) {
-                state.surfaceFitExpansionParentDepthThreshold = parentDepthThreshold;
-                rebuildSurfaceFitExpansionDebug(state, engine, scene);
-                applyWorkflowPresentation(state, scene);
-            } else {
-                state.surfaceFitExpansionParentDepthThreshold = parentDepthThreshold;
-            }
-        } else {
-            state.surfaceFitExpansionParentDepthThreshold = 0;
-            ImGui::TextUnformatted("Parent depth >= 0 (seed point)");
-        }
-        const auto& targetSample = state.surfaceTargetCache->samples[
-            expansionNeighborhood.targetSampleIndex];
+    if (state.normalFitReady) {
         ImGui::Text(
-            "Target index: (%d, %d, %d), depth %d",
-            targetSample.coordinate.x(),
-            targetSample.coordinate.y(),
-            targetSample.coordinate.z(),
-            expansionNeighborhood.targetDepth);
-        ImGui::Text(
-            "Target world: %.3f, %.3f, %.3f mm",
-            targetSample.worldPosition.x() * 1000.0,
-            targetSample.worldPosition.y() * 1000.0,
-            targetSample.worldPosition.z() * 1000.0);
-        if (expansionNeighborhood.sourceSampleIndex !=
-            std::numeric_limits<std::size_t>::max()) {
-            const auto& sourceSample = state.surfaceTargetCache->samples[
-                expansionNeighborhood.sourceSampleIndex];
-            ImGui::Text(
-                "Source index: (%d, %d, %d)",
-                sourceSample.coordinate.x(),
-                sourceSample.coordinate.y(),
-                sourceSample.coordinate.z());
-            ImGui::Text(
-                "Source world: %.3f, %.3f, %.3f mm",
-                sourceSample.worldPosition.x() * 1000.0,
-                sourceSample.worldPosition.y() * 1000.0,
-                sourceSample.worldPosition.z() * 1000.0);
-        } else {
-            ImGui::TextUnformatted("Source: seed / none");
-        }
-        ImGui::Text(
-            "Next batch: %zu | Source batch: %zu",
-            expansionNeighborhood.targetNextSampleIndices.size(),
-            expansionNeighborhood.sourceBatchSampleIndices.size());
-        ImGui::Text(
-            "Parent chain depth >= %d: %zu",
-            state.surfaceFitExpansionParentDepthThreshold,
-            state.surfaceFitExpansionDebugRenderer.statistics().parentPointCount);
+            "Core adjacency edges: %zu | opposing before global seed: %zu",
+            state.normalFitAdjacencyStatistics.adjacencyEdgeCount,
+            state.normalFitAdjacencyStatistics.opposingEdgeCount);
+        ImGui::TextUnformatted(
+            hasUsableOrientedNormalField(state)
+                ? "Preview field: globally seed-oriented fit"
+                : "Preview field: fitted axes; global seed pending");
     }
     ImGui::Text(
         "Fitted samples: %zu core / %zu transition",
         state.normalFitField.smoothedCoreCount,
         state.normalFitField.smoothedTransitionCount);
     ImGui::TextWrapped(
-        "This stage produces the seed field consumed by Surface Normal.");
+        "This stage produces the fitted field consumed by Local Flip Points.");
     ImGui::TextWrapped(
         "Fitted normals use only sample positions and index connectivity; their sign is not corrected from the source normal or VDB values.");
     ImGui::TextWrapped("Status: %s", state.status.c_str());
     if (state.normalFieldPreviewDirty) {
         rebuildPickedSurfaceFitPlane(state, engine, scene);
         rebuildSurfaceTargetPreview(state, engine, scene);
+        rebuildLocalNormalSeedDebug(state, engine, scene);
     }
     ImGui::End();
 }
@@ -3106,113 +3617,345 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
 void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
 {
     ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(390.0f, 560.0f), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(390.0f, 860.0f), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(1.0f);
-    ImGui::Begin("Surface Normal");
+    ImGui::Begin("Local Flip Points");
     state.mouseOverUi |= ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    if (!state.localNormalSeedPreview.valid &&
+        state.localNormalSeedSelected < state.localNormalSeeds.size() &&
+        !state.localNormalSeeds[state.localNormalSeedSelected].accepted &&
+        state.localNormalSeeds[state.localNormalSeedSelected].activeFlipPoint &&
+        hasUsablePrimaryOrientedNormalField(state)) {
+        updateLocalNormalSeedPreview(state);
+    }
     ImGui::TextWrapped(
-        "Optionally average the fitted surface normals without moving the SurfaceTarget samples.");
-    ImGui::TextWrapped(
-        "None keeps the Surface Fit / Normal Seed result unchanged.");
-    ImGui::TextWrapped(
-        "A saved orientation seed is applied to a separate oriented field for this stage and reconstruction.");
+        "The global orientation seed is maintained in Surface Fit. This panel only manages local flip points: each point is forced to flip and propagates only through opposing neighbors.");
     ImGui::Separator();
 
-    auto& settings = state.normalSmoothingSettings;
-    const char* neighborhoodLabels[] = {
-        "None",
-        "3 x 3 connected",
-        "5 x 5 connected"};
-    int neighborhoodIndex = settings.neighborhood ==
-            volume_surface::SurfaceNormalNeighborhood::Grid3x3
-        ? 1
-        : settings.neighborhood == volume_surface::SurfaceNormalNeighborhood::Grid5x5
-            ? 2
-            : 0;
-    if (ImGui::Combo(
-            "Trend neighborhood",
-            &neighborhoodIndex,
-            neighborhoodLabels,
-            3)) {
-        settings.neighborhood = neighborhoodIndex == 2
-            ? volume_surface::SurfaceNormalNeighborhood::Grid5x5
-            : neighborhoodIndex == 1
-                ? volume_surface::SurfaceNormalNeighborhood::Grid3x3
-                : volume_surface::SurfaceNormalNeighborhood::None;
-        clearSurfaceFitExpansionSelection(state);
-        state.normalFieldReady = false;
-        state.orientedNormalFieldReady = false;
-        state.orientedNormalField = {};
-        state.orientedNormalExpansionTrace = {};
-        state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
-        state.normalFieldPreviewDirty = true;
-        state.normalFieldStatus = "Normal field settings changed; build the selected mode";
+    auto drawLocalFlipPointList = [&]() {
+        ImGui::Text(
+            "Flip point list (%zu)",
+            state.localNormalSeeds.size());
+        ImGui::TextUnformatted(
+            "Each point keeps its color; disable it to exclude it from replay without deleting it.");
+        if (state.surfaceNormalSeed.valid) {
+            ImGui::Text(
+                "Global seed cache: (%d, %d, %d)",
+                state.surfaceNormalSeed.coordinate.x(),
+                state.surfaceNormalSeed.coordinate.y(),
+                state.surfaceNormalSeed.coordinate.z());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Focus global seed")) {
+                focusCameraOnWorldPosition(
+                    state,
+                    state.surfaceNormalSeed.worldPosition);
+            }
+        } else {
+            ImGui::TextUnformatted("Global seed cache: not loaded");
+        }
+        if (state.localNormalSeeds.empty()) {
+            ImGui::TextUnformatted(
+                "No local flip points. Add one from the expansion debug below.");
+            return;
+        }
+        const std::size_t noIndex = std::numeric_limits<std::size_t>::max();
+        std::size_t deleteIndex = noIndex;
+        bool listChanged = false;
+        for (std::size_t index = 0; index < state.localNormalSeeds.size(); ++index) {
+            auto& entry = state.localNormalSeeds[index];
+            ImGui::PushID(static_cast<int>(index));
+            bool enabled = entry.activeFlipPoint;
+            if (ImGui::Checkbox("Enable##enabled", &enabled)) {
+                entry.activeFlipPoint = enabled;
+                if (entry.accepted) {
+                    replayLocalNormalSeeds(state);
+                    saveLocalNormalSeedsToDisk(state);
+                    state.normalFieldPreviewDirty = true;
+                } else if (state.localNormalSeedSelected == index) {
+                    updateLocalNormalSeedPreview(state);
+                }
+                listChanged = true;
+            }
+            ImGui::SameLine();
+            const ImVec4 color(
+                static_cast<float>(entry.color[0]) / 255.0f,
+                static_cast<float>(entry.color[1]) / 255.0f,
+                static_cast<float>(entry.color[2]) / 255.0f,
+                static_cast<float>(entry.color[3]) / 255.0f);
+            ImGui::ColorButton(
+                "##color",
+                color,
+                ImGuiColorEditFlags_NoTooltip |
+                    ImGuiColorEditFlags_NoDragDrop,
+                ImVec2{14.0f, 14.0f});
+            ImGui::SameLine();
+            const std::string label = "#" + std::to_string(index) + " " +
+                (!entry.activeFlipPoint
+                    ? "disabled"
+                    : entry.accepted ? "accepted" : "preview");
+            if (ImGui::Selectable(
+                    label.c_str(),
+                    state.localNormalSeedSelected == index)) {
+                state.localNormalSeedSelected = index;
+                updateLocalNormalSeedPreview(state);
+                rebuildLocalNormalSeedDebug(state, engine, scene);
+            }
+            ImGui::TextWrapped(
+                "Core coordinate: (%d, %d, %d)",
+                entry.coordinate.x(),
+                entry.coordinate.y(),
+                entry.coordinate.z());
+            // Keep actions on their own line so long metadata cannot push
+            // buttons outside the panel's content region.
+            if (ImGui::SmallButton("Focus")) {
+                state.localNormalSeedSelected = index;
+                focusCameraOnLocalFlipPoint(state, entry.sampleIndex);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Delete")) {
+                deleteIndex = index;
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+            if (deleteIndex != noIndex) {
+                break;
+            }
+        }
+        if (deleteIndex != noIndex) {
+            state.localNormalSeeds.erase(
+                state.localNormalSeeds.begin() +
+                static_cast<std::ptrdiff_t>(deleteIndex));
+            if (state.localNormalSeeds.empty()) {
+                state.localNormalSeedSelected = noIndex;
+            } else if (state.localNormalSeedSelected != noIndex &&
+                       state.localNormalSeedSelected > deleteIndex) {
+                --state.localNormalSeedSelected;
+            } else if (state.localNormalSeedSelected != noIndex &&
+                       state.localNormalSeedSelected == deleteIndex) {
+                state.localNormalSeedSelected = std::min(
+                    deleteIndex,
+                    state.localNormalSeeds.size() - 1);
+            }
+            replayLocalNormalSeeds(state);
+            saveLocalNormalSeedsToDisk(state);
+            clearLocalNormalSeedPreview(state);
+            state.localNormalSeedStatus =
+                "Flip point deleted and accepted flip points replayed";
+            state.normalFieldPreviewDirty = true;
+            rebuildLocalNormalSeedDebug(state, engine, scene);
+        } else if (listChanged) {
+            rebuildLocalNormalSeedDebug(state, engine, scene);
+        }
+    };
+    drawLocalFlipPointList();
+    if (ImGui::Button("Replay selected flip point")) {
+        if (state.localNormalSeedSelected < state.localNormalSeeds.size()) {
+            state.localNormalSeeds[state.localNormalSeedSelected].activeFlipPoint = true;
+            state.localNormalSeeds[state.localNormalSeedSelected].accepted = true;
+            replayLocalNormalSeeds(state);
+            saveLocalNormalSeedsToDisk(state);
+            state.localNormalSeedStatus =
+                "Selected flip point enabled and replayed from the global baseline";
+            rebuildLocalNormalSeedDebug(state, engine, scene);
+        }
     }
-    ImGui::BeginDisabled(settings.neighborhood == volume_surface::SurfaceNormalNeighborhood::None);
-    float strength = static_cast<float>(settings.strength);
-    if (ImGui::SliderFloat("Trend strength", &strength, 0.0f, 1.0f, "%.2f")) {
-        settings.strength = std::clamp(static_cast<double>(strength), 0.0, 1.0);
-        clearSurfaceFitExpansionSelection(state);
-        state.normalFieldReady = false;
-        state.orientedNormalFieldReady = false;
-        state.orientedNormalField = {};
-        state.orientedNormalExpansionTrace = {};
-        state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
-        state.normalFieldPreviewDirty = true;
-        state.normalFieldStatus = "Normal field settings changed; build the selected mode";
+    ImGui::Separator();
+
+    ImGui::TextUnformatted("Global seed propagation debug");
+    ImGui::TextWrapped(
+        "Pick a Core point to inspect its recorded parent chain. The selected Core can then be added to the flip-point list without applying it yet.");
+    if (ImGui::Button(
+            state.surfaceFitExpansionPickArmed
+                ? "Click a Core point"
+                : "Pick expansion point")) {
+        state.surfaceFitExpansionPickArmed = true;
+        state.surfaceFitExpansionPickRequested = false;
+        state.localNormalSeedPickArmed = false;
+        state.reconstructionPickArmed = false;
+        state.orientationSeedPickArmed = false;
+        state.surfaceFitExpansionStatus =
+            "Click a visible Core point in the viewer";
     }
-    int robustIterations = static_cast<int>(std::clamp<std::size_t>(
-        settings.robustIterations,
-        1,
-        5));
-    if (ImGui::SliderInt("Robust iterations", &robustIterations, 1, 5)) {
-        settings.robustIterations = static_cast<std::size_t>(robustIterations);
+    ImGui::SameLine();
+    if (ImGui::Button("Clear debug")) {
         clearSurfaceFitExpansionSelection(state);
-        state.normalFieldReady = false;
-        state.orientedNormalFieldReady = false;
-        state.orientedNormalField = {};
-        state.orientedNormalExpansionTrace = {};
-        state.orientedNormalStatus = "Orientation seed must be reapplied after smoothing";
-        state.normalFieldPreviewDirty = true;
-        state.normalFieldStatus = "Normal field settings changed; build the selected mode";
+        rebuildSurfaceFitExpansionDebug(state, engine, scene);
+    }
+    bool expansionDebugChanged = false;
+    expansionDebugChanged |= ImGui::Checkbox(
+        "Show expansion neighborhood",
+        &state.surfaceFitExpansionDebugRenderer.settings().showNeighborhood);
+    expansionDebugChanged |= ImGui::Checkbox(
+        "Show fitted neighborhood",
+        &state.surfaceFitExpansionDebugRenderer.settings().showUnifiedNeighborhood);
+    expansionDebugChanged |= ImGui::Checkbox(
+        "Show expansion normals",
+        &state.surfaceFitExpansionDebugRenderer.settings().showCurrentPointNormals);
+    const std::int32_t maximumParentDepth = state.surfaceFitExpansionNeighborhood.valid
+        ? std::max<std::int32_t>(
+            0,
+            state.surfaceFitExpansionNeighborhood.targetDepth)
+        : 0;
+    int parentDepthThreshold = static_cast<int>(std::clamp<std::int32_t>(
+        state.surfaceFitExpansionParentDepthThreshold,
+        0,
+        maximumParentDepth));
+    if (ImGui::SliderInt(
+            "Minimum parent depth",
+            &parentDepthThreshold,
+            0,
+            maximumParentDepth)) {
+        state.surfaceFitExpansionParentDepthThreshold = parentDepthThreshold;
+        expansionDebugChanged = true;
+    }
+    if (expansionDebugChanged && state.surfaceFitExpansionNeighborhood.valid) {
+        rebuildSurfaceFitExpansionDebug(state, engine, scene);
+    }
+    ImGui::TextWrapped(
+        "Expansion debug: %s",
+        state.surfaceFitExpansionStatus.c_str());
+    if (state.surfaceFitExpansionNeighborhood.valid) {
+        const auto& debugStats = state.surfaceFitExpansionDebugRenderer.statistics();
+        ImGui::Text(
+            "Depth: %d | next: %zu | source batch: %zu | parents: %zu",
+            state.surfaceFitExpansionNeighborhood.targetDepth,
+            debugStats.targetNextPointCount,
+            debugStats.sourceBatchPointCount,
+            debugStats.parentPointCount);
+    }
+    ImGui::BeginDisabled(!state.surfaceFitExpansionNeighborhood.valid);
+    if (ImGui::Button("Add selected Core as flip point")) {
+        addLocalFlipPointAtSample(
+            state,
+            engine,
+            scene,
+            state.surfaceFitExpansionNeighborhood.targetSampleIndex);
     }
     ImGui::EndDisabled();
-    ImGui::Text(
-        "Trend support: %s",
-        neighborhoodIndex == 2 ? "up to 25" : neighborhoodIndex == 1 ? "up to 9" : "disabled");
 
-    if (ImGui::Button("Build / update normal field")) {
-        rebuildSurfaceNormalField(state);
-        rebuildOrientedNormalField(state);
-        state.normalFieldPreviewDirty = true;
-    }
-    ImGui::SameLine();
-    ImGui::TextWrapped("%s", state.normalFieldStatus.c_str());
-    if (state.surfaceNormalSeed.valid) {
-        ImGui::TextWrapped("Seed orientation: %s", state.orientedNormalStatus.c_str());
-    }
-    bool previewChanged = ImGui::Checkbox(
-        "Preview with smoothed normals",
-        &state.normalFieldPreviewSmoothed);
-    ImGui::SameLine();
-    previewChanged |= ImGui::Checkbox(
-        "Show normal vectors",
-        &state.surfaceTargetPreview.settings().showNormals);
-    previewChanged |= ImGui::Checkbox(
-        "Show points",
-        &state.surfaceTargetPreview.settings().showPoints);
-    if (previewChanged) {
-        state.normalFieldPreviewDirty = true;
-    }
-    ImGui::Text(
-        "Averaged samples: %zu core / %zu transition",
-        state.normalField.smoothedCoreCount,
-        state.normalField.smoothedTransitionCount);
+    ImGui::Separator();
+    ImGui::TextUnformatted("Current normal field");
     ImGui::TextWrapped(
-        "Changing parameters only updates the preview after Build / update is pressed.");
-    ImGui::TextWrapped("Status: %s", state.status.c_str());
+        "The displayed vectors use the global Seed result plus accepted local Flip Points. Before global Seed is available, fitted normals are shown as a fallback.");
+    if (ImGui::Checkbox(
+            "Show current normal vectors",
+            &state.surfaceTargetPreview.settings().showNormals)) {
+        state.normalFieldPreviewDirty = true;
+    }
+    std::size_t currentNormalSampleIndex = std::numeric_limits<std::size_t>::max();
+    if (state.surfaceFitExpansionNeighborhood.valid) {
+        currentNormalSampleIndex =
+            state.surfaceFitExpansionNeighborhood.targetSampleIndex;
+    } else if (state.localNormalSeedSelected < state.localNormalSeeds.size()) {
+        currentNormalSampleIndex =
+            state.localNormalSeeds[state.localNormalSeedSelected].sampleIndex;
+    }
+    if (state.surfaceTargetCache &&
+        currentNormalSampleIndex < state.surfaceTargetCache->samples.size() &&
+        currentNormalSampleIndex < state.normalFitField.normals.size()) {
+        const auto& sample = state.surfaceTargetCache->samples[currentNormalSampleIndex];
+        const openvdb::Vec3d fittedNormal(
+            state.normalFitField.normals[currentNormalSampleIndex]);
+        const openvdb::Vec3d currentNormal = hasUsableOrientedNormalField(state)
+            ? openvdb::Vec3d(state.orientedNormalField.normals[currentNormalSampleIndex])
+            : fittedNormal;
+        ImGui::Text(
+            "Core (%d, %d, %d)",
+            sample.coordinate.x(),
+            sample.coordinate.y(),
+            sample.coordinate.z());
+        ImGui::Text(
+            "Fitted axis: %.3f, %.3f, %.3f",
+            fittedNormal.x(),
+            fittedNormal.y(),
+            fittedNormal.z());
+        ImGui::Text(
+            "Current normal: %.3f, %.3f, %.3f",
+            currentNormal.x(),
+            currentNormal.y(),
+            currentNormal.z());
+    }
+
+    ImGui::TextWrapped("%s", state.localNormalSeedStatus.c_str());
+    ImGui::TextWrapped(
+        "Local flip-point cache: %s",
+        state.localNormalSeedCacheStatus.c_str());
+    ImGui::TextWrapped(
+        "Local flip-point file: %s",
+        state.localNormalSeedPath.empty()
+            ? "not assigned"
+            : state.localNormalSeedPath.string().c_str());
+    bool localPreviewChanged = false;
+    int maximumLocalSamples = static_cast<int>(std::clamp<std::size_t>(
+        state.localNormalSeedSettings.maximumCoreSamples,
+        1,
+        1'000'000));
+    if (ImGui::SliderInt(
+            "Preview sample limit",
+            &maximumLocalSamples,
+            1,
+            1'000'000,
+            "%d")) {
+        state.localNormalSeedSettings.maximumCoreSamples =
+            static_cast<std::size_t>(std::max(1, maximumLocalSamples));
+        updateLocalNormalSeedPreview(state);
+        localPreviewChanged = true;
+    }
+    float minimumAxisAlignment = static_cast<float>(
+        state.localNormalSeedSettings.minimumAxisAlignment);
+    if (ImGui::SliderFloat(
+            "Minimum axis alignment",
+            &minimumAxisAlignment,
+            0.0f,
+            1.0f,
+            "%.2f")) {
+        state.localNormalSeedSettings.minimumAxisAlignment =
+            std::clamp(static_cast<double>(minimumAxisAlignment), 0.0, 1.0);
+        updateLocalNormalSeedPreview(state);
+        localPreviewChanged = true;
+    }
+    float maximumLocalDistance = static_cast<float>(
+        state.localNormalSeedSettings.maximumDistanceMillimeters);
+    if (ImGui::SliderFloat(
+            "Maximum distance (mm, 0=off)",
+            &maximumLocalDistance,
+            0.0f,
+            500.0f,
+            "%.1f")) {
+        state.localNormalSeedSettings.maximumDistanceMillimeters =
+            std::max(0.0, static_cast<double>(maximumLocalDistance));
+        updateLocalNormalSeedPreview(state);
+        localPreviewChanged = true;
+    }
+    if (localPreviewChanged) {
+        rebuildLocalNormalSeedDebug(state, engine, scene);
+        state.normalFieldPreviewDirty = true;
+    }
+    if (state.localNormalSeedPreview.valid) {
+        ImGui::Text(
+            "Preview: %zu affected / %zu boundary / depth %d",
+            state.localNormalSeedPreview.affectedCoreSampleCount,
+            state.localNormalSeedPreview.boundaryCoreSampleCount,
+            state.localNormalSeedPreview.maximumDepth);
+        ImGui::Text(
+            "Preview radius: %.2f mm",
+            state.localNormalSeedPreview.maximumDistanceMillimeters);
+        ImGui::Text(
+            "Stops: continuation %zu / axis %zu / distance %zu / aligned %zu",
+            state.localNormalSeedPreview.surfaceContinuationBoundaryCount,
+            state.localNormalSeedPreview.axisAlignmentBoundaryCount,
+            state.localNormalSeedPreview.distanceBoundaryCount,
+            state.localNormalSeedPreview.alreadyAlignedBoundaryCount);
+        ImGui::Text(
+            "Stops: invalid normal %zu | max samples %s",
+            state.localNormalSeedPreview.invalidNormalBoundaryCount,
+            state.localNormalSeedPreview.maximumCoreSamplesReached
+                ? "reached"
+                : "not reached");
+    }
     if (state.normalFieldPreviewDirty) {
         rebuildSurfaceTargetPreview(state, engine, scene);
+        rebuildLocalNormalSeedDebug(state, engine, scene);
     }
     ImGui::End();
 }
@@ -3241,6 +3984,7 @@ void drawUi(
     ViewerState& state = *statePointer;
     processSurfaceFitPick(state, engine, scene, view);
     processSurfaceFitExpansionPick(state, engine, scene, view);
+    processLocalNormalSeedPick(state, engine, scene, view);
     processOrientationSeedPick(state, view);
     if (state.workflowController.stage() == WorkflowStage::WeightPainting) {
         state.brushInteractionController.processPendingCenter(state, engine, scene);
@@ -3345,6 +4089,7 @@ std::unique_ptr<FilamentApp2> createViewer(
             createGpuSlot(*state, *engine, *scene, index);
         }
         rebuildSurfaceTargetPreview(*state, *engine, *scene);
+        rebuildLocalNormalSeedDebug(*state, *engine, *scene);
         createBrushHeatmapResources(*state, *engine, *scene);
         createBrushCursorResources(*state, *engine, *scene);
         if (state->replayBrushProfile) {
@@ -3433,6 +4178,7 @@ std::unique_ptr<FilamentApp2> createViewer(
         state->surfaceTargetPreview.destroy(*engine, *scene);
         state->surfaceFitPlaneRenderer.destroy(*engine, *scene);
         state->surfaceFitExpansionDebugRenderer.destroy(*engine, *scene);
+        state->surfaceNormalLocalSeedRenderer.destroy(*engine, *scene);
         state->meshRenderer.destroyAll(*engine, *scene);
         for (auto& slot : state->slots) {
             slot.visible = false;
@@ -3581,6 +4327,10 @@ int main(int argc, char** argv)
                       << " transition=" << state->surfaceTargetCache->transitionCount
                       << " build_ms=" << state->surfaceTargetBuildMilliseconds
                       << " cache_status=" << state->surfaceTargetCacheStatus << '\n';
+            std::cout << "surface_target.local_flip_points="
+                      << state->localNormalSeeds.size()
+                      << " local_seed_cache_status="
+                      << state->localNormalSeedCacheStatus << '\n';
         }
         printMeshInfo(*state);
         if (options.inspectOnly) {

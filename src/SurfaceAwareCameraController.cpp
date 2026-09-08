@@ -145,6 +145,28 @@ void SurfaceAwareCameraController::endDrag() noexcept
     cancelDrag();
 }
 
+void SurfaceAwareCameraController::focusOn(
+    const openvdb::Vec3d& sceneTarget) noexcept
+{
+    if (!finiteVector(sceneTarget)) {
+        return;
+    }
+    if (!mHasPose) {
+        reset(
+            sceneTarget + openvdb::Vec3d{0.0, 0.0, 5.0},
+            sceneTarget,
+            openvdb::Vec3d{0.0, 1.0, 0.0});
+        return;
+    }
+    const openvdb::Vec3d translation = sceneTarget - mPose.target;
+    if (!finiteVector(translation)) {
+        return;
+    }
+    mPose.eye += translation;
+    mPose.target = sceneTarget;
+    cancelDrag();
+}
+
 SurfaceAwareCameraWheelResult SurfaceAwareCameraController::applyWheel(
     std::int32_t rawDelta,
     const CameraPickHit& hit,
