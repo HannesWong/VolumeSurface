@@ -37,8 +37,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare_filame
 构建 Viewer：
 
 ```powershell
-cmd.exe /d /c scripts\build_viewer_msvc_ninja.cmd
+cmd.exe /d /c .\scripts\build_viewer_msvc_ninja.cmd
 ```
+
+该脚本可从任意工作目录启动：自动定位工程根目录、选择可用的 Visual Studio 2022 x64 C++ 工具链、检查 Filament、配置 `build-viewer` 并只编译 `volume_surface_viewer`。如需使用非标准 MSVC 安装位置，可先将 `VOLUME_SURFACE_VCVARS64` 设为对应的 `vcvars64.bat` 绝对路径。
 
 启动时默认读取右臂样例的 `density = 255` 等值面：
 
