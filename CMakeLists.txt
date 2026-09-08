@@ -144,6 +144,10 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitExpansionDebugPoints.mat")
     set(_surface_fit_expansion_points_package
         "${_viewer_material_dir}/surfaceFitExpansionDebugPoints.filamat")
+    set(_surface_fit_neighborhood_points_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitNeighborhoodDebugPoints.mat")
+    set(_surface_fit_neighborhood_points_package
+        "${_viewer_material_dir}/surfaceFitNeighborhoodDebugPoints.filamat")
     set(_surface_fit_plane_source "${CMAKE_CURRENT_SOURCE_DIR}/materials/surfaceFitPlane.mat")
     set(_surface_fit_plane_package "${_viewer_material_dir}/surfaceFitPlane.filamat")
     add_custom_command(
@@ -216,6 +220,16 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         COMMENT "Compiling SurfaceFit expansion selected point material"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${_surface_fit_neighborhood_points_package}"
+        COMMAND matc ${MATC_BASE_FLAGS}
+            -o "${_surface_fit_neighborhood_points_package}"
+            "${_surface_fit_neighborhood_points_source}"
+        MAIN_DEPENDENCY "${_surface_fit_neighborhood_points_source}"
+        DEPENDS matc
+        COMMENT "Compiling Surface Fit neighborhood debug point material"
+        VERBATIM
+    )
 
     get_resgen_vars("${_viewer_resource_dir}" volume_surface_viewer_resources)
     add_custom_command(
@@ -227,6 +241,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             "${_surface_target_point_pick_package}"
             "${_surface_target_debug_package}"
             "${_surface_fit_expansion_points_package}"
+            "${_surface_fit_neighborhood_points_package}"
             "${_surface_fit_plane_package}"
         DEPENDS resgen
             "${_brush_heatmap_package}"
@@ -235,6 +250,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
             "${_surface_target_point_pick_package}"
             "${_surface_target_debug_package}"
             "${_surface_fit_expansion_points_package}"
+            "${_surface_fit_neighborhood_points_package}"
             "${_surface_fit_plane_package}"
         COMMENT "Embedding viewer materials"
         VERBATIM
@@ -271,6 +287,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         src/SurfaceTargetPointPicker.cpp
         src/SurfaceFitPlaneRenderer.cpp
         src/SurfaceFitExpansionDebugRenderer.cpp
+        src/SurfaceFitNeighborhoodDebugRenderer.cpp
         src/SurfaceNormalSeedStore.cpp
         src/SurfaceTargetCacheRepository.cpp
         src/WorkflowController.cpp
@@ -330,6 +347,7 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushCursorRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushHeatmapRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceFitExpansionDebugRenderer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceFitNeighborhoodDebugRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceFitPlaneRenderer.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetPointPicker.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetPreview.cpp"

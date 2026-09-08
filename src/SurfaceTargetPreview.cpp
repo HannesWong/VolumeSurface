@@ -422,10 +422,6 @@ struct SurfaceTargetPreview::Impl {
                 continue;
             }
             instance->setParameter("POINT_RADIUS", radius);
-            instance->setParameter("NORMAL_CULL", false);
-            instance->setParameter("AMBIENT_LEVEL", 0.12f);
-            instance->setParameter("SPECULAR_STRENGTH", 0.22f);
-            instance->setParameter("SHININESS", 24.0f);
         }
         if (normals.materialInstance) {
             // Normal diagnostics must remain visible from both sides.

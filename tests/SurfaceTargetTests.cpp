@@ -236,6 +236,30 @@ void testConnectedNormalTrend()
     require(std::abs(openvdb::Vec3d(fittedWithoutSourceNormals.normals[coreIndex]).dot(
         openvdb::Vec3d(fitted.normals[coreIndex]))) > 0.99,
         "geometry-only fit changed the fitted normal axis");
+    const auto fitInspection = volume_surface::inspectSurfaceFitNeighborhood(
+        cache,
+        coreIndex,
+        volume_surface::SurfaceFitNeighborhood::Grid9x9,
+        2,
+        nullptr);
+    require(fitInspection.valid &&
+            fitInspection.centerSampleIndex == coreIndex &&
+            !fitInspection.samples.empty() &&
+            fitInspection.samples.size() == fitInspection.sampleIndices.size(),
+        "surface fit neighborhood inspection did not return the selected center");
+    std::size_t classifiedSamples = 0;
+    for (const auto& sample : fitInspection.samples) {
+        if (sample.state == volume_surface::SurfaceFitNeighborhoodInspection::SampleState::Kept ||
+            sample.state == volume_surface::SurfaceFitNeighborhoodInspection::SampleState::Downweighted ||
+            sample.state == volume_surface::SurfaceFitNeighborhoodInspection::SampleState::RejectedTopology ||
+            sample.state == volume_surface::SurfaceFitNeighborhoodInspection::SampleState::RejectedResidual) {
+            ++classifiedSamples;
+        }
+    }
+    require(classifiedSamples == fitInspection.samples.size() &&
+            fitInspection.keptSampleCount + fitInspection.downweightedSampleCount +
+                fitInspection.rejectedSampleCount == fitInspection.samples.size(),
+        "surface fit neighborhood inspection returned unclassified samples");
     const auto gridOverload = volume_surface::fitSurfaceTargetNormals(
         *grid,
         cache,

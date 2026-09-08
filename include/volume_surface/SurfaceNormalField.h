@@ -74,9 +74,30 @@ struct SurfaceNormalExpansionNeighborhood
 
 struct SurfaceFitNeighborhoodInspection
 {
+    enum class SampleState : std::uint8_t {
+        Kept,
+        Downweighted,
+        RejectedTopology,
+        RejectedResidual,
+    };
+
+    struct Sample
+    {
+        std::size_t sampleIndex = static_cast<std::size_t>(-1);
+        double weight = 0.0;
+        double topologyWeight = 1.0;
+        double planeResidual = 0.0;
+        SampleState state = SampleState::Kept;
+    };
+
     bool valid = false;
     std::size_t centerSampleIndex = static_cast<std::size_t>(-1);
     std::vector<std::size_t> sampleIndices;
+    std::vector<Sample> samples;
+    std::size_t keptSampleCount = 0;
+    std::size_t downweightedSampleCount = 0;
+    std::size_t rejectedSampleCount = 0;
+    double fitResidualScale = 0.0;
 };
 
 struct SurfaceNormalAdjacencyStatistics
@@ -144,6 +165,14 @@ SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
     const SurfaceTargetCache& target,
     std::size_t centerSampleIndex,
     SurfaceFitNeighborhood neighborhood);
+
+SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
+    const SurfaceTargetCache& target,
+    std::size_t centerSampleIndex,
+    SurfaceFitNeighborhood neighborhood,
+    std::size_t robustIterations,
+    const SurfaceMeshContinuityField* meshContinuity,
+    double minimumMeshContinuity = 0.05);
 
 SurfaceNormalField smoothSurfaceTargetNormals(
     const SurfaceTargetCache& target,

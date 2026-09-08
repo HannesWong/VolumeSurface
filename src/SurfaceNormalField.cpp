@@ -376,11 +376,21 @@ std::vector<NeighborhoodCandidate> collectTransitionNeighborhood(
     return candidates;
 }
 
+struct TrendFitDetails
+{
+    openvdb::Vec3d mean{0.0};
+    std::vector<double> baseWeights;
+    std::vector<double> weights;
+    std::vector<double> residuals;
+    double residualScale = 0.0;
+};
+
 bool fitTrendNormal(
     const SurfaceTargetCache& target,
     const std::vector<NeighborhoodCandidate>& candidates,
     std::size_t robustIterations,
-    openvdb::Vec3d& normal)
+    openvdb::Vec3d& normal,
+    TrendFitDetails* details = nullptr)
 {
     if (candidates.size() < 3) {
         return false;
@@ -393,6 +403,7 @@ bool fitTrendNormal(
     }
     std::vector<double> weights = baseWeights;
     const std::size_t iterations = std::max<std::size_t>(1, robustIterations);
+    openvdb::Vec3d finalMean(0.0);
     for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
         openvdb::Vec3d mean(0.0);
         double weightSum = 0.0;
@@ -406,6 +417,7 @@ bool fitTrendNormal(
             return false;
         }
         mean /= weightSum;
+        finalMean = mean;
         Matrix3 covariance{{
             {{0.0, 0.0, 0.0}},
             {{0.0, 0.0, 0.0}},
@@ -450,6 +462,25 @@ bool fitTrendNormal(
                 : 1.0 / std::max(normalized, 1.0);
             weights[index] = baseWeights[index] * robustWeight;
         }
+    }
+    if (details) {
+        details->mean = finalMean;
+        details->baseWeights = baseWeights;
+        details->weights = weights;
+        details->residuals.assign(candidates.size(), 0.0);
+        details->residualScale = 0.0;
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            const openvdb::Vec3d position(
+                target.samples[candidates[index].sampleIndex].worldPosition);
+            details->residuals[index] = std::abs(
+                (position - finalMean).dot(normal));
+        }
+        std::vector<double> sortedResiduals = details->residuals;
+        std::nth_element(
+            sortedResiduals.begin(),
+            sortedResiduals.begin() + sortedResiduals.size() / 2,
+            sortedResiduals.end());
+        details->residualScale = sortedResiduals[sortedResiduals.size() / 2] * 1.4826;
     }
     return true;
 }
@@ -605,9 +636,30 @@ SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
     std::size_t centerSampleIndex,
     SurfaceFitNeighborhood neighborhood)
 {
+    return inspectSurfaceFitNeighborhood(
+        target,
+        centerSampleIndex,
+        neighborhood,
+        2,
+        nullptr,
+        0.05);
+}
+
+SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
+    const SurfaceTargetCache& target,
+    std::size_t centerSampleIndex,
+    SurfaceFitNeighborhood neighborhood,
+    std::size_t robustIterations,
+    const SurfaceMeshContinuityField* meshContinuity,
+    double minimumMeshContinuity)
+{
     SurfaceFitNeighborhoodInspection result;
     if (centerSampleIndex >= target.samples.size() ||
-        target.samples[centerSampleIndex].kind != SurfaceTargetSampleKind::Core) {
+        target.samples[centerSampleIndex].kind != SurfaceTargetSampleKind::Core ||
+        robustIterations == 0 ||
+        !std::isfinite(minimumMeshContinuity) ||
+        minimumMeshContinuity < 0.0 || minimumMeshContinuity > 1.0 ||
+        (meshContinuity && !meshContinuity->matchesSampleCount(target.samples.size()))) {
         return result;
     }
 
@@ -626,8 +678,79 @@ SurfaceFitNeighborhoodInspection inspectSurfaceFitNeighborhood(
     result.valid = true;
     result.centerSampleIndex = centerSampleIndex;
     result.sampleIndices.reserve(candidates.size());
+    result.samples.reserve(candidates.size());
+    std::vector<NeighborhoodCandidate> fitCandidates;
+    std::vector<std::size_t> fitCandidateIndices;
+    fitCandidates.reserve(candidates.size());
+    fitCandidateIndices.reserve(candidates.size());
     for (const auto& candidate : candidates) {
         result.sampleIndices.push_back(candidate.sampleIndex);
+        const double topologyWeight = candidate.sampleIndex == centerSampleIndex
+            ? 1.0
+            : meshContinuity
+                ? surfaceMeshContinuityWeight(
+                    *meshContinuity,
+                    target,
+                    centerSampleIndex,
+                    candidate.sampleIndex)
+                : 1.0;
+        SurfaceFitNeighborhoodInspection::Sample sample;
+        sample.sampleIndex = candidate.sampleIndex;
+        sample.topologyWeight = std::clamp(topologyWeight, 0.0, 1.0);
+        if (sample.topologyWeight < minimumMeshContinuity) {
+            sample.state = SurfaceFitNeighborhoodInspection::SampleState::RejectedTopology;
+            ++result.rejectedSampleCount;
+        } else {
+            fitCandidateIndices.push_back(result.samples.size());
+            fitCandidates.push_back(candidate);
+        }
+        result.samples.push_back(sample);
+    }
+
+    openvdb::Vec3d fitNormal(0.0);
+    TrendFitDetails fitDetails;
+    if (!fitTrendNormal(
+            target,
+            fitCandidates,
+            robustIterations,
+            fitNormal,
+            &fitDetails)) {
+        for (const std::size_t resultIndex : fitCandidateIndices) {
+            auto& sample = result.samples[resultIndex];
+            sample.state = SurfaceFitNeighborhoodInspection::SampleState::RejectedResidual;
+            ++result.rejectedSampleCount;
+        }
+        return result;
+    }
+
+    result.fitResidualScale = fitDetails.residualScale;
+    for (std::size_t fitIndex = 0; fitIndex < fitCandidateIndices.size(); ++fitIndex) {
+        auto& sample = result.samples[fitCandidateIndices[fitIndex]];
+        sample.weight = fitIndex < fitDetails.weights.size()
+            ? std::clamp(fitDetails.weights[fitIndex], 0.0, 1.0)
+            : 0.0;
+        sample.planeResidual = fitIndex < fitDetails.residuals.size()
+            ? std::max(0.0, fitDetails.residuals[fitIndex])
+            : 0.0;
+        const double baseWeight = fitIndex < fitDetails.baseWeights.size()
+            ? fitDetails.baseWeights[fitIndex]
+            : 0.0;
+        const double robustRatio = baseWeight > kEpsilon
+            ? sample.weight / baseWeight
+            : 0.0;
+        if (sample.sampleIndex == centerSampleIndex) {
+            sample.state = SurfaceFitNeighborhoodInspection::SampleState::Kept;
+            ++result.keptSampleCount;
+        } else if (robustRatio < 0.25) {
+            sample.state = SurfaceFitNeighborhoodInspection::SampleState::RejectedResidual;
+            ++result.rejectedSampleCount;
+        } else if (robustRatio < 0.85 || sample.topologyWeight < 0.65) {
+            sample.state = SurfaceFitNeighborhoodInspection::SampleState::Downweighted;
+            ++result.downweightedSampleCount;
+        } else {
+            sample.state = SurfaceFitNeighborhoodInspection::SampleState::Kept;
+            ++result.keptSampleCount;
+        }
     }
     return result;
 }

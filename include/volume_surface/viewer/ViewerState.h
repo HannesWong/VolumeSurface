@@ -33,6 +33,7 @@
 #include "volume_surface/viewer/SliceRenderer.h"
 #include "volume_surface/viewer/SurfaceFitPlaneRenderer.h"
 #include "volume_surface/viewer/SurfaceFitExpansionDebugRenderer.h"
+#include "volume_surface/viewer/SurfaceFitNeighborhoodDebugRenderer.h"
 #include "volume_surface/viewer/SurfaceTargetPointPicker.h"
 #include "volume_surface/viewer/SurfaceNormalSeedStore.h"
 #include "volume_surface/viewer/ViewerContext.h"
@@ -107,13 +108,18 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     SurfaceTargetPointPicker surfaceTargetPointPicker;
     SurfaceFitPlaneRenderer surfaceFitPlaneRenderer;
     SurfaceFitExpansionDebugRenderer surfaceFitExpansionDebugRenderer;
+    SurfaceFitNeighborhoodDebugRenderer surfaceFitNeighborhoodDebugRenderer;
     volume_surface::SurfaceNormalExpansionNeighborhood surfaceFitExpansionNeighborhood;
+    volume_surface::SurfaceFitNeighborhoodInspection surfaceFitNeighborhoodInspection;
     std::int32_t surfaceFitExpansionParentDepthThreshold = 0;
     bool surfaceFitExpansionPickArmed = false;
     bool surfaceFitExpansionPickRequested = false;
     int surfaceFitExpansionPickX = 0;
     int surfaceFitExpansionPickY = 0;
     std::string surfaceFitExpansionStatus = "No debug Core point selected";
+    bool surfaceFitNeighborhoodPickArmed = false;
+    bool surfaceFitNeighborhoodPickRequested = false;
+    std::string surfaceFitNeighborhoodStatus = "No fit neighborhood center selected";
     SurfaceNormalSeed surfaceNormalSeed;
     std::filesystem::path surfaceNormalSeedPath;
     std::string surfaceNormalSeedStatus = "No saved orientation seed";

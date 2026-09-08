@@ -73,6 +73,10 @@ using WorkflowPanel = volume_surface::viewer::WorkflowPanel;
 using SurfaceFitPlaneRenderer = volume_surface::viewer::SurfaceFitPlaneRenderer;
 using SurfaceFitExpansionDebugRenderer =
     volume_surface::viewer::SurfaceFitExpansionDebugRenderer;
+using SurfaceFitNeighborhoodDebugRenderer =
+    volume_surface::viewer::SurfaceFitNeighborhoodDebugRenderer;
+using SurfaceFitNeighborhoodDisplayMode =
+    volume_surface::viewer::SurfaceFitNeighborhoodDisplayMode;
 using SurfaceTargetPointPicker =
     volume_surface::viewer::SurfaceTargetPointPicker;
 using SurfaceNormalSeed = volume_surface::viewer::SurfaceNormalSeed;
@@ -132,6 +136,10 @@ void clearSurfaceFitExpansionSelection(ViewerState& state)
     state.surfaceFitExpansionParentDepthThreshold = 0;
     state.surfaceFitExpansionDebugRenderer.settings().showNeighborhood = false;
     state.surfaceFitExpansionStatus = "No debug Core point selected";
+    state.surfaceFitNeighborhoodInspection = {};
+    state.surfaceFitNeighborhoodPickArmed = false;
+    state.surfaceFitNeighborhoodPickRequested = false;
+    state.surfaceFitNeighborhoodStatus = "No fit neighborhood center selected";
 }
 
 bool hasUsableNormalField(const ViewerState& state)
@@ -311,7 +319,11 @@ public:
                     mState->workflowController.stage() == WorkflowStage::SurfaceFit;
                 const bool expansionDebugPick = mState->surfaceFitExpansionPickArmed &&
                     mState->workflowController.stage() == WorkflowStage::SurfaceFit;
-                if ((surfaceFitPick || orientationSeedPick || expansionDebugPick) &&
+                const bool neighborhoodDebugPick =
+                    mState->surfaceFitNeighborhoodPickArmed &&
+                    mState->workflowController.stage() == WorkflowStage::SurfaceFit;
+                if ((surfaceFitPick || orientationSeedPick || expansionDebugPick ||
+                     neighborhoodDebugPick) &&
                     !mState->brushControlDown &&
                     !pointerOverUi &&
                     event.mouseButton.button == 1) {
@@ -329,7 +341,12 @@ public:
                         mState->surfaceFitExpansionPickRequested = true;
                         mState->surfaceFitExpansionPickX = event.mouseButton.x;
                         mState->surfaceFitExpansionPickY = event.mouseButton.y;
-                        mState->surfaceFitExpansionPickArmed = false;
+                        if (neighborhoodDebugPick) {
+                            mState->surfaceFitNeighborhoodPickRequested = true;
+                            mState->surfaceFitNeighborhoodPickArmed = false;
+                        } else {
+                            mState->surfaceFitExpansionPickArmed = false;
+                        }
                     }
                     mCameraGrabActive = false;
                     event.type = filament::app::AppEvent::Type::TEXTINPUT;
@@ -1058,6 +1075,9 @@ void applyWorkflowPresentation(ViewerState& state, Scene& scene)
     state.surfaceFitExpansionDebugRenderer.setVisible(
         scene,
         state.workflowController.stage() == WorkflowStage::SurfaceFit);
+    state.surfaceFitNeighborhoodDebugRenderer.setVisible(
+        scene,
+        state.workflowController.stage() == WorkflowStage::SurfaceFit);
     if (!showHeatmap) {
         state.brushCursorVisible = false;
     }
@@ -1076,6 +1096,12 @@ void setWorkflowStage(ViewerState& state, Scene& scene, WorkflowStage stage)
     if (stage != WorkflowStage::SurfaceFit) {
         state.orientationSeedPickArmed = false;
         state.orientationSeedPickRequested = false;
+    }
+    if (stage != WorkflowStage::SurfaceFit) {
+        state.surfaceFitExpansionPickArmed = false;
+        state.surfaceFitExpansionPickRequested = false;
+        state.surfaceFitNeighborhoodPickArmed = false;
+        state.surfaceFitNeighborhoodPickRequested = false;
     }
     state.normalFieldPreviewActive = stage == WorkflowStage::NormalField;
     state.normalFitPreviewActive = stage == WorkflowStage::SurfaceFit;
@@ -1745,17 +1771,44 @@ void rebuildSurfaceFitExpansionDebug(
             }
         }
     }
-    if (state.surfaceFitExpansionDebugRenderer.settings().showUnifiedNeighborhood &&
+    const bool needFitNeighborhoodInspection =
+        state.surfaceFitExpansionDebugRenderer.settings().showUnifiedNeighborhood ||
+        state.surfaceFitNeighborhoodDebugRenderer.settings().displayMode !=
+            SurfaceFitNeighborhoodDisplayMode::None;
+    if (needFitNeighborhoodInspection &&
         state.surfaceTargetCache &&
-        state.surfaceFitExpansionNeighborhood.valid) {
+        state.surfaceFitNeighborhoodInspection.valid) {
+        fitNeighborhood = state.surfaceFitNeighborhoodInspection;
+        inputs.fitNeighborhood = &fitNeighborhood;
+    } else if (state.surfaceFitExpansionDebugRenderer.settings().showUnifiedNeighborhood &&
+               state.surfaceTargetCache &&
+               state.surfaceFitExpansionNeighborhood.valid) {
         fitNeighborhood = volume_surface::inspectSurfaceFitNeighborhood(
             *state.surfaceTargetCache,
             state.surfaceFitExpansionNeighborhood.targetSampleIndex,
-            state.normalFitSettings.neighborhood);
+            state.normalFitSettings.neighborhood,
+            state.normalFitSettings.robustIterations,
+            state.surfaceMeshContinuityReady
+                ? &state.surfaceMeshContinuity
+                : nullptr);
         inputs.fitNeighborhood = &fitNeighborhood;
     }
     state.surfaceFitExpansionDebugRenderer.rebuild(engine, scene, inputs);
     state.surfaceFitExpansionDebugRenderer.setVisible(
+        scene,
+        state.workflowController.stage() == WorkflowStage::SurfaceFit);
+    SurfaceFitNeighborhoodDebugRenderer::Inputs neighborhoodInputs;
+    neighborhoodInputs.cache = state.surfaceTargetCache.get();
+    neighborhoodInputs.inspection = inputs.fitNeighborhood;
+    neighborhoodInputs.referenceCenter = inputs.referenceCenter;
+    neighborhoodInputs.voxelSize = inputs.voxelSize;
+    neighborhoodInputs.displayScale = inputs.displayScale;
+    neighborhoodInputs.sourcePointScale = inputs.sourcePointScale;
+    state.surfaceFitNeighborhoodDebugRenderer.rebuild(
+        engine,
+        scene,
+        neighborhoodInputs);
+    state.surfaceFitNeighborhoodDebugRenderer.setVisible(
         scene,
         state.workflowController.stage() == WorkflowStage::SurfaceFit);
 }
@@ -2175,14 +2228,25 @@ void processSurfaceFitExpansionPick(
     if (!gpuResult.ready && !state.surfaceFitExpansionPickRequested) {
         return;
     }
+    const bool neighborhoodPick = state.surfaceFitNeighborhoodPickArmed ||
+        state.surfaceFitNeighborhoodPickRequested;
     if (state.workflowController.stage() != WorkflowStage::SurfaceFit ||
         !state.grid || !state.surfaceTargetCache ||
         state.surfaceTargetCache->empty() ||
-        !state.orientedNormalExpansionTrace.matchesSampleCount(
-            state.surfaceTargetCache->samples.size())) {
+        (!neighborhoodPick &&
+            !state.orientedNormalExpansionTrace.matchesSampleCount(
+                state.surfaceTargetCache->samples.size())) ||
+        (neighborhoodPick && !state.normalFitReady)) {
         state.surfaceFitExpansionPickRequested = false;
-        state.surfaceFitExpansionStatus =
-            "Debug pick requires completed fitted normal expansion";
+        if (neighborhoodPick) {
+            state.surfaceFitNeighborhoodPickArmed = false;
+            state.surfaceFitNeighborhoodPickRequested = false;
+            state.surfaceFitNeighborhoodStatus =
+                "Fit neighborhood debug requires completed Surface Fit";
+        } else {
+            state.surfaceFitExpansionStatus =
+                "Debug pick requires completed fitted normal expansion";
+        }
         return;
     }
 
@@ -2191,7 +2255,46 @@ void processSurfaceFitExpansionPick(
         if (targetSampleIndex >= state.surfaceTargetCache->samples.size() ||
             state.surfaceTargetCache->samples[targetSampleIndex].kind !=
                 volume_surface::SurfaceTargetSampleKind::Core) {
-            state.surfaceFitExpansionStatus = "GPU pick returned an invalid Core sample";
+            if (neighborhoodPick) {
+                state.surfaceFitNeighborhoodPickArmed = false;
+                state.surfaceFitNeighborhoodPickRequested = false;
+                state.surfaceFitNeighborhoodStatus =
+                    "GPU pick returned an invalid Core sample";
+            } else {
+                state.surfaceFitExpansionStatus =
+                    "GPU pick returned an invalid Core sample";
+            }
+            return;
+        }
+        if (neighborhoodPick) {
+            state.surfaceFitNeighborhoodInspection =
+                volume_surface::inspectSurfaceFitNeighborhood(
+                    *state.surfaceTargetCache,
+                    targetSampleIndex,
+                    state.normalFitSettings.neighborhood,
+                    state.normalFitSettings.robustIterations,
+                    state.surfaceMeshContinuityReady
+                        ? &state.surfaceMeshContinuity
+                        : nullptr);
+            state.surfaceFitNeighborhoodPickArmed = false;
+            state.surfaceFitNeighborhoodPickRequested = false;
+            if (!state.surfaceFitNeighborhoodInspection.valid) {
+                state.surfaceFitNeighborhoodStatus =
+                    "The selected Core point has no fit neighborhood";
+                rebuildSurfaceFitExpansionDebug(state, engine, scene);
+                applyWorkflowPresentation(state, scene);
+                return;
+            }
+            const auto& sample = state.surfaceTargetCache->samples[targetSampleIndex];
+            state.surfaceFitNeighborhoodStatus =
+                "Fit center selected at (" +
+                std::to_string(sample.coordinate.x()) + "," +
+                std::to_string(sample.coordinate.y()) + "," +
+                std::to_string(sample.coordinate.z()) + ") " +
+                (gpu ? "via GPU point pick" :
+                    "distance " + std::to_string(targetDistance * 1000.0) + " mm");
+            rebuildSurfaceFitExpansionDebug(state, engine, scene);
+            applyWorkflowPresentation(state, scene);
             return;
         }
         state.surfaceFitExpansionNeighborhood =
@@ -2228,7 +2331,11 @@ void processSurfaceFitExpansionPick(
     if (!gpuResult.ready && state.surfaceFitExpansionPickRequested) {
         if (state.surfaceTargetPointPicker.hasPendingRequest()) {
             state.surfaceFitExpansionPickRequested = false;
-            state.surfaceFitExpansionStatus = "GPU point pick pending";
+            if (neighborhoodPick) {
+                state.surfaceFitNeighborhoodStatus = "GPU point pick pending";
+            } else {
+                state.surfaceFitExpansionStatus = "GPU point pick pending";
+            }
             return;
         }
         const auto viewport = view.getViewport();
@@ -2247,7 +2354,11 @@ void processSurfaceFitExpansionPick(
                 scaleX,
                 scaleY)) {
             state.surfaceFitExpansionPickRequested = false;
-            state.surfaceFitExpansionStatus = "GPU point pick pending";
+            if (neighborhoodPick) {
+                state.surfaceFitNeighborhoodStatus = "GPU point pick pending";
+            } else {
+                state.surfaceFitExpansionStatus = "GPU point pick pending";
+            }
             return;
         }
     }
@@ -2259,7 +2370,14 @@ void processSurfaceFitExpansionPick(
             state.surfaceFitExpansionPickX,
             state.surfaceFitExpansionPickY,
             ray)) {
-        state.surfaceFitExpansionStatus = "Unable to build the debug pick ray";
+        if (neighborhoodPick) {
+            state.surfaceFitNeighborhoodPickArmed = false;
+            state.surfaceFitNeighborhoodPickRequested = false;
+            state.surfaceFitNeighborhoodStatus =
+                "Unable to build the fit neighborhood pick ray";
+        } else {
+            state.surfaceFitExpansionStatus = "Unable to build the debug pick ray";
+        }
         return;
     }
 
@@ -2271,8 +2389,15 @@ void processSurfaceFitExpansionPick(
     }
     const CameraPickHit hit = state.cameraPickController.pick(ray, visibleSlots);
     if (!hit.hit) {
-        state.surfaceFitExpansionStatus =
-            "No GPU Core point or visible surface was hit for the debug point";
+        if (neighborhoodPick) {
+            state.surfaceFitNeighborhoodPickArmed = false;
+            state.surfaceFitNeighborhoodPickRequested = false;
+            state.surfaceFitNeighborhoodStatus =
+                "No Core point or visible surface was hit for the fit neighborhood";
+        } else {
+            state.surfaceFitExpansionStatus =
+                "No GPU Core point or visible surface was hit for the debug point";
+        }
         return;
     }
 
@@ -2296,8 +2421,15 @@ void processSurfaceFitExpansionPick(
             targetPosition,
             targetSampleIndex,
             targetDistance)) {
-        state.surfaceFitExpansionStatus =
-            "The debug pick is not near a Core SurfaceTarget sample";
+        if (neighborhoodPick) {
+            state.surfaceFitNeighborhoodPickArmed = false;
+            state.surfaceFitNeighborhoodPickRequested = false;
+            state.surfaceFitNeighborhoodStatus =
+                "The pick is not near a Core SurfaceTarget sample";
+        } else {
+            state.surfaceFitExpansionStatus =
+                "The debug pick is not near a Core SurfaceTarget sample";
+        }
         return;
     }
     completePick(targetSampleIndex, targetDistance, false);
@@ -3025,6 +3157,70 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
         state.normalFieldPreviewDirty = true;
     }
     ImGui::Separator();
+    ImGui::TextUnformatted("Fit neighborhood filter debug");
+    if (ImGui::Button(
+            state.surfaceFitNeighborhoodPickArmed
+                ? "Click a Core point"
+                : "Pick fit center")) {
+        state.surfaceFitNeighborhoodPickArmed = true;
+        state.surfaceFitNeighborhoodPickRequested = false;
+        state.surfaceFitExpansionPickArmed = false;
+        state.reconstructionPickArmed = false;
+        state.orientationSeedPickArmed = false;
+        state.surfaceFitNeighborhoodStatus =
+            "Click a visible Core point in the viewer";
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear fit debug")) {
+        state.surfaceFitNeighborhoodInspection = {};
+        state.surfaceFitNeighborhoodPickArmed = false;
+        state.surfaceFitNeighborhoodPickRequested = false;
+        state.surfaceFitNeighborhoodStatus = "No fit neighborhood center selected";
+        rebuildSurfaceFitExpansionDebug(state, engine, scene);
+        applyWorkflowPresentation(state, scene);
+    }
+    const char* fitDebugModeLabels[] = {
+        "None",
+        "All candidates",
+        "Kept / weighted",
+        "Rejected",
+        "Weight heatmap"};
+    int fitDebugMode = static_cast<int>(
+        state.surfaceFitNeighborhoodDebugRenderer.settings().displayMode);
+    if (ImGui::Combo(
+            "Display filter result",
+            &fitDebugMode,
+            fitDebugModeLabels,
+            static_cast<int>(sizeof(fitDebugModeLabels) / sizeof(fitDebugModeLabels[0])))) {
+        fitDebugMode = std::clamp(fitDebugMode, 0, 4);
+        state.surfaceFitNeighborhoodDebugRenderer.settings().displayMode =
+            static_cast<SurfaceFitNeighborhoodDisplayMode>(fitDebugMode);
+        rebuildSurfaceFitExpansionDebug(state, engine, scene);
+        applyWorkflowPresentation(state, scene);
+    }
+    ImGui::TextWrapped(
+        "Blue: candidates. Green/orange: kept and downweighted. Red/purple: rejected by topology or plane residual.");
+    ImGui::TextWrapped("Status: %s", state.surfaceFitNeighborhoodStatus.c_str());
+    const auto& fitInspection = state.surfaceFitNeighborhoodInspection;
+    if (fitInspection.valid && state.surfaceTargetCache) {
+        const auto& centerSample = state.surfaceTargetCache->samples[
+            fitInspection.centerSampleIndex];
+        ImGui::Text(
+            "Center: (%d, %d, %d)",
+            centerSample.coordinate.x(),
+            centerSample.coordinate.y(),
+            centerSample.coordinate.z());
+        ImGui::Text(
+            "Candidates: %zu | kept: %zu | downweighted: %zu | rejected: %zu",
+            fitInspection.samples.size(),
+            fitInspection.keptSampleCount,
+            fitInspection.downweightedSampleCount,
+            fitInspection.rejectedSampleCount);
+        ImGui::Text(
+            "Plane residual scale: %.6f mm",
+            fitInspection.fitResidualScale * 1000.0);
+    }
+    ImGui::Separator();
     ImGui::TextUnformatted("26-neighborhood expansion debug");
     if (ImGui::Button(
             state.surfaceFitExpansionPickArmed
@@ -3489,6 +3685,7 @@ std::unique_ptr<FilamentApp2> createViewer(
         state->surfaceTargetPreview.destroy(*engine, *scene);
         state->surfaceFitPlaneRenderer.destroy(*engine, *scene);
         state->surfaceFitExpansionDebugRenderer.destroy(*engine, *scene);
+        state->surfaceFitNeighborhoodDebugRenderer.destroy(*engine, *scene);
         state->meshRenderer.destroyAll(*engine, *scene);
         for (auto& slot : state->slots) {
             slot.visible = false;

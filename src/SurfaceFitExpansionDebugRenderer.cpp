@@ -247,10 +247,6 @@ void createPointPrimitive(
         throw std::runtime_error("Failed to create SurfaceFit expansion point material");
     }
     primitive.materialInstance->setCullingMode(MaterialInstance::CullingMode::NONE);
-    primitive.materialInstance->setParameter("NORMAL_CULL", false);
-    primitive.materialInstance->setParameter("AMBIENT_LEVEL", 0.45f);
-    primitive.materialInstance->setParameter("SPECULAR_STRENGTH", 0.05f);
-    primitive.materialInstance->setParameter("SHININESS", 8.0f);
     primitive.entity = EntityManager::get().create();
     RenderableManager::Builder(1)
         .boundingBox({center, halfExtent})

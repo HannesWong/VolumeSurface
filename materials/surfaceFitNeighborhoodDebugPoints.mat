@@ -1,5 +1,5 @@
 material {
-    name : SurfaceFitExpansionDebugPoints,
+    name : SurfaceFitNeighborhoodDebugPoints,
     requires : [
         custom0,
         color
@@ -32,13 +32,11 @@ vertex {
 fragment {
     void material(inout MaterialInputs material) {
         prepareMaterial(material);
-
         vec2 sprite = gl_PointCoord * 2.0 - 1.0;
         if (dot(sprite, sprite) > 1.0) {
             material.baseColor = vec4(0.0);
             return;
         }
-
-        material.baseColor = vec4(getColor().rgb, 1.0);
+        material.baseColor = getColor();
     }
 }
