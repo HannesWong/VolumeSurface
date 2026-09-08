@@ -593,6 +593,28 @@ void testLocalNormalSeedPreviewAndApply()
     }
 }
 
+void testSurfaceTargetPrimaryComponentFilter()
+{
+    volume_surface::SurfaceTargetCache cache;
+    for (const openvdb::Coord coordinate : {
+             openvdb::Coord(0, 0, 0),
+             openvdb::Coord(1, 0, 0),
+             openvdb::Coord(10, 0, 0)}) {
+        volume_surface::SurfaceTargetSample sample;
+        sample.coordinate = coordinate;
+        sample.kind = volume_surface::SurfaceTargetSampleKind::Core;
+        sample.worldPosition = openvdb::Vec3f(coordinate.asVec3d());
+        cache.samples.push_back(sample);
+        ++cache.coreCount;
+    }
+
+    const auto filtered = volume_surface::retainLargestSurfaceTargetComponent(cache);
+    require(filtered.componentCount == 2,
+        "surface target component filter did not find disconnected components");
+    require(filtered.primary.coreCount == 2 && filtered.excludedCoreCount == 1,
+        "surface target component filter retained the wrong primary component");
+}
+
 void testLocalFlipPointChainAndCap()
 {
     const auto grid = createMetricGrid(openvdb::Vec3d(0.001, 0.001, 0.001));
@@ -710,6 +732,7 @@ int main()
         testFitSignRepairUsesPhysicalArea();
         testFitSignRepairProtectsSeedNeighborhood();
         testLocalNormalSeedPreviewAndApply();
+        testSurfaceTargetPrimaryComponentFilter();
         testLocalFlipPointChainAndCap();
         testLocalFlipPointFollowsExpansionChildrenOnly();
         testVdbSurfaceProbe();

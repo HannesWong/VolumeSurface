@@ -1392,6 +1392,12 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
                     static_cast<std::uint8_t>(1)));
         }
     }
+    if (!result.mesh.empty()) {
+        auto meshSplit = splitSurfaceMeshComponents(result.mesh);
+        result.surfaceComponentCount = meshSplit.componentCount;
+        result.excludedTriangleCount = meshSplit.excludedTriangleCount;
+        result.mesh = std::move(meshSplit.primary);
+    }
     result.timings.meshExtractionMilliseconds =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - meshStart).count();

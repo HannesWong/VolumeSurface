@@ -537,6 +537,118 @@ SurfaceTargetCache extractSurfaceTarget(
     return cache;
 }
 
+SurfaceTargetComponentFilterResult retainLargestSurfaceTargetComponent(
+    const SurfaceTargetCache& cache)
+{
+    SurfaceTargetComponentFilterResult result;
+    if (cache.samples.empty()) {
+        return result;
+    }
+
+    std::unordered_map<openvdb::Coord, std::size_t, CoordHasher> coreIndices;
+    coreIndices.reserve(cache.coreCount * 2 + 1);
+    for (std::size_t sampleIndex = 0; sampleIndex < cache.samples.size(); ++sampleIndex) {
+        if (cache.samples[sampleIndex].kind == SurfaceTargetSampleKind::Core) {
+            coreIndices.emplace(cache.samples[sampleIndex].coordinate, sampleIndex);
+        }
+    }
+    if (coreIndices.empty()) {
+        result.primary = cache;
+        return result;
+    }
+
+    std::vector<std::int32_t> componentBySample(cache.samples.size(), -1);
+    std::vector<std::size_t> componentSizes;
+    std::vector<std::size_t> pending;
+    constexpr std::array<int, 3> offsets{-1, 0, 1};
+    for (const auto& entry : coreIndices) {
+        const std::size_t seedIndex = entry.second;
+        if (componentBySample[seedIndex] >= 0) {
+            continue;
+        }
+        const auto componentIndex = static_cast<std::int32_t>(componentSizes.size());
+        std::size_t componentSize = 0;
+        pending.clear();
+        pending.push_back(seedIndex);
+        componentBySample[seedIndex] = componentIndex;
+        while (!pending.empty()) {
+            const std::size_t currentIndex = pending.back();
+            pending.pop_back();
+            ++componentSize;
+            const auto center = cache.samples[currentIndex].coordinate;
+            for (const int dz : offsets) {
+                for (const int dy : offsets) {
+                    for (const int dx : offsets) {
+                        if (dx == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
+                        if (found == coreIndices.end() ||
+                            componentBySample[found->second] >= 0) {
+                            continue;
+                        }
+                        componentBySample[found->second] = componentIndex;
+                        pending.push_back(found->second);
+                    }
+                }
+            }
+        }
+        componentSizes.push_back(componentSize);
+    }
+
+    result.componentCount = componentSizes.size();
+    const auto primaryComponent = static_cast<std::int32_t>(std::distance(
+        componentSizes.begin(),
+        std::max_element(componentSizes.begin(), componentSizes.end())));
+    result.primary.samples.reserve(cache.samples.size());
+
+    auto transitionBelongsToPrimary = [&](const SurfaceTargetSample& sample) {
+        const int layer = std::max(1, static_cast<int>(sample.transitionLayer));
+        const auto center = sample.coordinate;
+        for (int dz = -layer; dz <= layer; ++dz) {
+            for (int dy = -layer; dy <= layer; ++dy) {
+                for (int dx = -layer; dx <= layer; ++dx) {
+                    if (std::abs(dx) + std::abs(dy) + std::abs(dz) > layer) {
+                        continue;
+                    }
+                    const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
+                    if (found != coreIndices.end() &&
+                        componentBySample[found->second] == primaryComponent) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    for (std::size_t sampleIndex = 0; sampleIndex < cache.samples.size(); ++sampleIndex) {
+        const auto& sample = cache.samples[sampleIndex];
+        bool keep = false;
+        if (sample.kind == SurfaceTargetSampleKind::Core) {
+            keep = componentBySample[sampleIndex] == primaryComponent;
+            if (!keep) {
+                ++result.excludedCoreCount;
+            }
+        } else {
+            keep = transitionBelongsToPrimary(sample);
+            if (!keep) {
+                ++result.excludedTransitionCount;
+            }
+        }
+        if (!keep) {
+            continue;
+        }
+        result.primary.samples.push_back(sample);
+        if (sample.kind == SurfaceTargetSampleKind::Core) {
+            ++result.primary.coreCount;
+        } else {
+            ++result.primary.transitionCount;
+        }
+    }
+    return result;
+}
+
 bool saveSurfaceTargetCache(
     const std::filesystem::path& path,
     const SurfaceTargetCache& cache,

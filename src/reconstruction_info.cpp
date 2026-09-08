@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include <openvdb/io/File.h>
 #include <openvdb/tools/Interpolation.h>
@@ -137,7 +138,10 @@ int main(int argc, char** argv)
         const auto grid = loadFloatGrid(path, gridName);
         volume_surface::SurfaceTargetSettings targetSettings;
         targetSettings.isoValue = isoValue;
-        const auto target = volume_surface::extractSurfaceTarget(*grid, targetSettings);
+        auto target = volume_surface::extractSurfaceTarget(*grid, targetSettings);
+        auto targetComponentFilter =
+            volume_surface::retainLargestSurfaceTargetComponent(target);
+        target = std::move(targetComponentFilter.primary);
         const auto rawMesh = volume_surface::extractIsoSurface(*grid, isoValue, 0.1);
 
         volume_surface::SurfaceReconstructionSettings settings;

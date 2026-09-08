@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -27,9 +28,19 @@ struct SurfaceMesh {
     [[nodiscard]] std::size_t triangleCount() const noexcept { return indices.size() / 3; }
 };
 
+struct SurfaceMeshComponentSplit {
+    SurfaceMesh primary;
+    SurfaceMesh excluded;
+    std::size_t componentCount = 0;
+    std::size_t primaryTriangleCount = 0;
+    std::size_t excludedTriangleCount = 0;
+};
+
 SurfaceMesh extractIsoSurface(
     const openvdb::FloatGrid& grid,
     double isoValue,
     double adaptivity = 0.0);
+
+SurfaceMeshComponentSplit splitSurfaceMeshComponents(const SurfaceMesh& mesh);
 
 } // namespace volume_surface

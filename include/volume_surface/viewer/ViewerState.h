@@ -65,6 +65,13 @@ struct ViewerState : DocumentSession, BrushInteractionState {
         MeshSlot{"Result B", {}, {0.98f, 0.55f, 0.30f}, 0.65f, false},
         MeshSlot{"Result C", {}, {0.50f, 0.90f, 0.50f}, 0.65f, false}};
     MeshRenderer meshRenderer;
+    MeshSlot excludedSourceSlot{
+        "Excluded Source",
+        {},
+        {1.0f, 0.86f, 0.08f},
+        1.0f,
+        false};
+    MeshRenderer excludedSourceMeshRenderer;
     CameraPickController cameraPickController;
     SurfaceAwareCameraController surfaceAwareCameraController;
     PresentationController presentationController;
@@ -149,6 +156,9 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     int orientationSeedPickY = 0;
     std::string surfaceTargetStatus = "Surface target pending";
     std::string surfaceTargetCacheStatus = "No saved surface target cache";
+    std::size_t surfaceTargetComponentCount = 0;
+    std::size_t surfaceTargetExcludedCoreCount = 0;
+    std::size_t surfaceTargetExcludedTransitionCount = 0;
     std::string reconstructionStatus = "Result A has not been generated";
     bool reconstructionPickArmed = false;
     bool reconstructionPickRequested = false;

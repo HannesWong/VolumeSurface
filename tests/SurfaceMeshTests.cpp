@@ -69,6 +69,23 @@ int main()
         return EXIT_FAILURE;
     }
 
+    volume_surface::SurfaceMesh disconnected;
+    disconnected.vertices.resize(6);
+    disconnected.vertices[0].position = {0.0f, 0.0f, 0.0f};
+    disconnected.vertices[1].position = {1.0f, 0.0f, 0.0f};
+    disconnected.vertices[2].position = {0.0f, 1.0f, 0.0f};
+    disconnected.vertices[3].position = {10.0f, 0.0f, 0.0f};
+    disconnected.vertices[4].position = {11.0f, 0.0f, 0.0f};
+    disconnected.vertices[5].position = {10.0f, 1.0f, 0.0f};
+    disconnected.indices = {0, 1, 2, 3, 4, 5};
+    const auto split = volume_surface::splitSurfaceMeshComponents(disconnected);
+    if (split.componentCount != 2 || split.primaryTriangleCount != 1 ||
+        split.excludedTriangleCount != 1 || split.primary.triangleCount() != 1 ||
+        split.excluded.triangleCount() != 1) {
+        std::cerr << "Expected disconnected mesh components to be split\n";
+        return EXIT_FAILURE;
+    }
+
     std::cout << "vertices=" << mesh.vertices.size()
               << " triangles=" << mesh.triangleCount() << '\n';
     return EXIT_SUCCESS;

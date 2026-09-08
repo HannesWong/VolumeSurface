@@ -49,6 +49,14 @@ struct SurfaceTargetCache
     [[nodiscard]] bool empty() const noexcept { return samples.empty(); }
 };
 
+struct SurfaceTargetComponentFilterResult
+{
+    SurfaceTargetCache primary;
+    std::size_t componentCount = 0;
+    std::size_t excludedCoreCount = 0;
+    std::size_t excludedTransitionCount = 0;
+};
+
 struct SurfaceTargetCacheMetadata
 {
     std::string sourcePath;
@@ -65,6 +73,9 @@ struct SurfaceTargetCacheMetadata
 SurfaceTargetCache extractSurfaceTarget(
     const openvdb::FloatGrid& grid,
     const SurfaceTargetSettings& settings = {});
+
+SurfaceTargetComponentFilterResult retainLargestSurfaceTargetComponent(
+    const SurfaceTargetCache& cache);
 
 bool saveSurfaceTargetCache(
     const std::filesystem::path& path,

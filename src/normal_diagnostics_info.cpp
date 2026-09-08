@@ -12,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <openvdb/io/File.h>
@@ -103,6 +104,9 @@ int main(int argc, char** argv)
             std::cerr << "cache_load=failed reason=" << error << "\n";
             target = volume_surface::extractSurfaceTarget(*grid, targetSettings);
         }
+        auto targetComponentFilter =
+            volume_surface::retainLargestSurfaceTargetComponent(target);
+        target = std::move(targetComponentFilter.primary);
 
         volume_surface::SurfaceNormalFitSettings fitSettings;
         fitSettings.neighborhood = volume_surface::SurfaceFitNeighborhood::Grid9x9;

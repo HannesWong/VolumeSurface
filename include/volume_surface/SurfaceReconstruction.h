@@ -53,6 +53,8 @@ struct SurfaceReconstructionResult
     std::size_t projectionRejectedCount = 0;
     std::size_t projectionDensityRejectedCount = 0;
     double projectionMaximumDisplacement = 0.0;
+    std::size_t surfaceComponentCount = 0;
+    std::size_t excludedTriangleCount = 0;
     SurfaceReconstructionTimings timings;
 
     [[nodiscard]] bool empty() const noexcept { return mesh.empty(); }

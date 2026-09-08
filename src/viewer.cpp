@@ -1121,6 +1121,14 @@ void applyWorkflowPresentation(ViewerState& state, Scene& scene)
         state.surfaceFitPlaneRenderer,
         state.brushHeatmap,
         presentationState);
+    const bool showExcludedSource =
+        state.workflowController.stage() == WorkflowStage::Source &&
+        state.excludedSourceSlot.available();
+    state.excludedSourceSlot.visible = showExcludedSource;
+    state.excludedSourceMeshRenderer.setVisible(
+        scene,
+        0,
+        showExcludedSource);
     state.surfaceFitExpansionDebugRenderer.setVisible(
         scene,
         state.workflowController.stage() == WorkflowStage::SurfaceFit ||
@@ -1172,6 +1180,15 @@ void destroyGpuSlot(
     state.slots[slotIndex].visible = false;
 }
 
+void destroyExcludedSourceMesh(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene)
+{
+    state.excludedSourceMeshRenderer.destroy(engine, scene, 0);
+    state.excludedSourceSlot.visible = false;
+}
+
 void createGpuSlot(
     ViewerState& state,
     Engine& engine,
@@ -1200,6 +1217,34 @@ void createGpuSlot(
         slotIndex,
         slot.mesh,
         state.context.coordinates);
+}
+
+void createExcludedSourceMesh(
+    ViewerState& state,
+    Engine& engine,
+    Scene& scene)
+{
+    destroyExcludedSourceMesh(state, engine, scene);
+    if (!state.excludedSourceSlot.available()) {
+        return;
+    }
+    const auto& mapper = state.context.coordinates;
+    state.excludedSourceMeshRenderer.create(
+        engine,
+        scene,
+        0,
+        state.excludedSourceSlot,
+        mapper,
+        state.context.app->getDefaultMaterial(),
+        state.context.app->getTransparentMaterial());
+    state.excludedSourceMeshRenderer.applyStyle(
+        engine,
+        0,
+        state.excludedSourceSlot);
+    state.excludedSourceMeshRenderer.setVisible(
+        scene,
+        0,
+        state.workflowController.stage() == WorkflowStage::Source);
 }
 
 void destroyBrushHeatmapGeometry(
@@ -1330,6 +1375,20 @@ volume_surface::SurfaceTargetCacheMetadata surfaceTargetCacheMetadata(
         state.gridName,
         state.grid.get(),
         state.surfaceTargetSettings);
+}
+
+bool filterSurfaceTargetToPrimaryComponent(
+    ViewerState& state,
+    volume_surface::SurfaceTargetCache& cache)
+{
+    auto filtered = volume_surface::retainLargestSurfaceTargetComponent(cache);
+    state.surfaceTargetComponentCount = filtered.componentCount;
+    state.surfaceTargetExcludedCoreCount = filtered.excludedCoreCount;
+    state.surfaceTargetExcludedTransitionCount = filtered.excludedTransitionCount;
+    const bool changed = filtered.excludedCoreCount > 0 ||
+        filtered.excludedTransitionCount > 0;
+    cache = std::move(filtered.primary);
+    return changed;
 }
 
 std::filesystem::path surfaceNormalLocalSeedPathForInput(
@@ -1614,6 +1673,7 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
     state.surfaceTargetBuildMilliseconds =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();
+    const bool filtered = filterSurfaceTargetToPrimaryComponent(state, loaded);
     state.surfaceTargetCache = std::make_shared<volume_surface::SurfaceTargetCache>(
         std::move(loaded));
     clearSurfaceFitExpansionSelection(state);
@@ -1643,6 +1703,13 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
         " core / " +
         std::to_string(state.surfaceTargetCache->transitionCount) +
         " transition samples";
+    if (filtered) {
+        const std::string loadedStatus = state.surfaceTargetCacheStatus;
+        if (!saveSurfaceTargetCacheToDisk(state)) {
+            state.surfaceTargetCacheStatus =
+                loadedStatus + " (filtered in memory; cache rewrite failed)";
+        }
+    }
     loadLocalNormalSeedsFromDisk(state);
     loadSurfaceNormalSeedFromDisk(state);
     state.sliceDirty = true;
@@ -1672,10 +1739,12 @@ bool rebuildSurfaceTargetCache(
     }
     const auto start = std::chrono::steady_clock::now();
     try {
+        auto extractedCache = volume_surface::extractSurfaceTarget(
+            *state.grid,
+            state.surfaceTargetSettings);
+        filterSurfaceTargetToPrimaryComponent(state, extractedCache);
         auto cache = std::make_shared<volume_surface::SurfaceTargetCache>(
-            volume_surface::extractSurfaceTarget(
-                *state.grid,
-                state.surfaceTargetSettings));
+            std::move(extractedCache));
         state.surfaceTargetBuildMilliseconds =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
@@ -1715,6 +1784,9 @@ bool rebuildSurfaceTargetCache(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
         state.surfaceTargetCache.reset();
+        state.surfaceTargetComponentCount = 0;
+        state.surfaceTargetExcludedCoreCount = 0;
+        state.surfaceTargetExcludedTransitionCount = 0;
         clearSurfaceFitExpansionSelection(state);
         state.localNormalSeeds.clear();
         clearSurfaceNormalFitResult(state);
@@ -2206,11 +2278,12 @@ void rebuildReference(ViewerState& state, Engine& engine, Scene& scene)
 {
     try {
         state.status = "Extracting density iso-surface...";
-        auto mesh = volume_surface::extractIsoSurface(
+        auto rawMesh = volume_surface::extractIsoSurface(
             *state.grid,
             state.isoValue,
             state.adaptivity);
-        if (mesh.empty()) {
+        auto meshSplit = volume_surface::splitSurfaceMeshComponents(rawMesh);
+        if (meshSplit.primary.empty()) {
             state.status = "No surface found at the selected density value";
             return;
         }
@@ -2218,7 +2291,9 @@ void rebuildReference(ViewerState& state, Engine& engine, Scene& scene)
         auto& reference = state.slots[0];
         destroyBrushHeatmapResources(state, engine, scene);
         destroyGpuSlot(state, engine, scene, 0);
-        reference.mesh = std::move(mesh);
+        destroyExcludedSourceMesh(state, engine, scene);
+        reference.mesh = std::move(meshSplit.primary);
+        state.excludedSourceSlot.mesh = std::move(meshSplit.excluded);
         reference.visible = true;
         for (std::size_t index = 1; index < state.slots.size(); ++index) {
             auto& resultSlot = state.slots[index];
@@ -2243,6 +2318,7 @@ void rebuildReference(ViewerState& state, Engine& engine, Scene& scene)
         state.sliceDirty = true;
         updateReferenceTransform(state);
         createGpuSlot(state, engine, scene, 0);
+        createExcludedSourceMesh(state, engine, scene);
         createBrushHeatmapResources(state, engine, scene);
         state.brushPaintingPanel.rebuildHeatmapFromWeightField(state, engine, scene);
         rebuildSurfaceTargetCache(state);
@@ -2255,7 +2331,10 @@ void rebuildReference(ViewerState& state, Engine& engine, Scene& scene)
         state.brushStrokeFinalizeRequested = false;
         state.brushInteractionController.discardProfileStroke(state);
         state.brushStatus = "Reference rebuilt; Ctrl + left-drag to paint brush weights";
-        state.status = "Reference rebuilt";
+        state.status =
+            "Reference rebuilt; excluded " +
+            std::to_string(state.excludedSourceSlot.mesh.triangleCount()) +
+            " disconnected triangles";
     } catch (const std::exception& error) {
         state.status = std::string("Rebuild failed: ") + error.what();
     }
@@ -2318,6 +2397,11 @@ bool rebuildSurfaceReconstruction(ViewerState& state, Engine& engine, Scene& sce
             std::to_string(resultSlot.mesh.triangleCount()) +
             " triangles" +
             " (source topology + MLS projection)" +
+            (result.excludedTriangleCount == 0
+                ? std::string()
+                : " (excluded " +
+                    std::to_string(result.excludedTriangleCount) +
+                    " disconnected triangles)") +
             "; normals: " + reconstructionNormalSourceName(state);
         state.status = "Surface Reconstruction Result A ready";
         applyWorkflowPresentation(state, scene);
@@ -3211,6 +3295,16 @@ void drawSourceWindow(ViewerState& state)
             bounds.max().z());
     }
     ImGui::Separator();
+    ImGui::Text(
+        "Primary mesh: %zu vertices / %zu triangles",
+        state.slots[0].mesh.vertices.size(),
+        state.slots[0].mesh.triangleCount());
+    ImGui::Text(
+        "Excluded mesh: %zu vertices / %zu triangles",
+        state.excludedSourceSlot.mesh.vertices.size(),
+        state.excludedSourceSlot.mesh.triangleCount());
+    ImGui::TextWrapped(
+        "Excluded disconnected components are shown in yellow here and are not used downstream.");
     ImGui::TextWrapped(
         "The source stage is read-only. Use Surface Target to inspect the extracted surface data before editing downstream data.");
     ImGui::TextWrapped("Status: %s", state.status.c_str());
@@ -3238,6 +3332,11 @@ void drawSurfaceTargetWindow(ViewerState& state, Engine& engine, Scene& scene)
         ImGui::Text(
             "Target extraction: %.1f ms",
             state.surfaceTargetBuildMilliseconds);
+        ImGui::Text(
+            "Components: %zu | excluded core: %zu | excluded transition: %zu",
+            state.surfaceTargetComponentCount,
+            state.surfaceTargetExcludedCoreCount,
+            state.surfaceTargetExcludedTransitionCount);
     }
     if (state.brushHierarchy) {
         ImGui::Text(
@@ -4088,6 +4187,7 @@ std::unique_ptr<FilamentApp2> createViewer(
         for (std::size_t index = 0; index < state->slots.size(); ++index) {
             createGpuSlot(*state, *engine, *scene, index);
         }
+        createExcludedSourceMesh(*state, *engine, *scene);
         rebuildSurfaceTargetPreview(*state, *engine, *scene);
         rebuildLocalNormalSeedDebug(*state, *engine, *scene);
         createBrushHeatmapResources(*state, *engine, *scene);
@@ -4180,6 +4280,7 @@ std::unique_ptr<FilamentApp2> createViewer(
         state->surfaceFitExpansionDebugRenderer.destroy(*engine, *scene);
         state->surfaceNormalLocalSeedRenderer.destroy(*engine, *scene);
         state->meshRenderer.destroyAll(*engine, *scene);
+        state->excludedSourceMeshRenderer.destroyAll(*engine, *scene);
         for (auto& slot : state->slots) {
             slot.visible = false;
         }
@@ -4246,7 +4347,9 @@ void printMeshInfo(const ViewerState& state)
               << "iso=" << state.isoValue << '\n'
               << "adaptivity=" << state.adaptivity << '\n'
               << "vertices=" << mesh.vertices.size() << '\n'
-              << "triangles=" << mesh.triangleCount() << '\n';
+              << "triangles=" << mesh.triangleCount() << '\n'
+              << "excluded_vertices=" << state.excludedSourceSlot.mesh.vertices.size() << '\n'
+              << "excluded_triangles=" << state.excludedSourceSlot.mesh.triangleCount() << '\n';
 }
 
 void printSliceInfo(const ViewerState& state)
@@ -4308,10 +4411,14 @@ int main(int argc, char** argv)
             state->sliceIndices[axis] =
                 (state->sliceBounds.min()[axis] + state->sliceBounds.max()[axis]) / 2;
         }
-        state->slots[0].mesh = volume_surface::extractIsoSurface(
+        const auto rawSourceMesh = volume_surface::extractIsoSurface(
             *state->grid,
             options.isoValue,
             options.adaptivity);
+        auto sourceMeshSplit = volume_surface::splitSurfaceMeshComponents(
+            rawSourceMesh);
+        state->slots[0].mesh = std::move(sourceMeshSplit.primary);
+        state->excludedSourceSlot.mesh = std::move(sourceMeshSplit.excluded);
         if (state->slots[0].mesh.empty()) {
             throw std::runtime_error("No surface found at the selected density value");
         }
@@ -4325,6 +4432,10 @@ int main(int argc, char** argv)
                       << state->surfaceTargetCache->samples.size()
                       << " core=" << state->surfaceTargetCache->coreCount
                       << " transition=" << state->surfaceTargetCache->transitionCount
+                      << " components=" << state->surfaceTargetComponentCount
+                      << " excluded_core=" << state->surfaceTargetExcludedCoreCount
+                      << " excluded_transition="
+                      << state->surfaceTargetExcludedTransitionCount
                       << " build_ms=" << state->surfaceTargetBuildMilliseconds
                       << " cache_status=" << state->surfaceTargetCacheStatus << '\n';
             std::cout << "surface_target.local_flip_points="
