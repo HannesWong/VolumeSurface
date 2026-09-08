@@ -255,16 +255,33 @@ void testConnectedNormalTrend()
 
     const openvdb::Vec3d fittedAxis =
         openvdb::Vec3d(fitted.normals[coreIndex]).unit();
+    volume_surface::SurfaceNormalExpansionTrace expansionTrace;
     const auto oriented = volume_surface::orientSurfaceTargetNormals(
         cache,
         fitted,
         coreIndex,
-        -fittedAxis);
+        -fittedAxis,
+        {},
+        &expansionTrace);
     require(oriented.normals.size() == fitted.normals.size() &&
             oriented.smoothedCoreCount > 0,
         "orientation seed produced no oriented core normals");
     require(openvdb::Vec3d(oriented.normals[coreIndex]).dot(-fittedAxis) > 0.99,
         "orientation seed did not set the selected seed direction");
+    for (std::size_t index = 0; index < cache.samples.size(); ++index) {
+        const std::int32_t parent = expansionTrace.parentBySample[index];
+        if (parent < 0 || static_cast<std::size_t>(parent) >= oriented.normals.size()) {
+            continue;
+        }
+        const openvdb::Vec3d normal = openvdb::Vec3d(oriented.normals[index]);
+        const openvdb::Vec3d parentNormal =
+            openvdb::Vec3d(oriented.normals[static_cast<std::size_t>(parent)]);
+        if (normal.lengthSqr() <= 1.0e-12 || parentNormal.lengthSqr() <= 1.0e-12) {
+            continue;
+        }
+        require(normal.dot(parentNormal) > 0.0,
+            "orientation propagation reversed a selected parent edge");
+    }
     std::size_t firstTransitionIndex = 0;
     std::size_t secondTransitionIndex = 0;
     bool foundFirstTransition = false;

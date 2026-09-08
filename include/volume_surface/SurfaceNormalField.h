@@ -6,6 +6,7 @@
 
 #include <openvdb/openvdb.h>
 
+#include "volume_surface/SurfaceMeshContinuity.h"
 #include "volume_surface/SurfaceTarget.h"
 
 namespace volume_surface {
@@ -24,7 +25,7 @@ enum class SurfaceNormalNeighborhood : std::uint8_t {
 
 struct SurfaceNormalFitSettings
 {
-    SurfaceFitNeighborhood neighborhood = SurfaceFitNeighborhood::Grid3x3;
+    SurfaceFitNeighborhood neighborhood = SurfaceFitNeighborhood::Grid9x9;
     std::size_t robustIterations = 2;
     double isoValue = 255.0;
 };
@@ -42,6 +43,9 @@ struct SurfaceNormalOrientationSettings
     double minimumAlignment = 0.15;
     // Reject links whose displacement is dominated by the local surface normal.
     double maximumSurfaceNormalComponent = 0.75;
+    // Reject mesh-derived propagation links that have no reliable topology
+    // support in the source triangle mesh.
+    double minimumMeshContinuity = 0.05;
 };
 
 struct SurfaceNormalExpansionTrace
@@ -156,7 +160,8 @@ SurfaceNormalField orientSurfaceTargetNormals(
     std::size_t seedSampleIndex,
     const openvdb::Vec3d& seedDirection,
     const SurfaceNormalOrientationSettings& settings = {},
-    SurfaceNormalExpansionTrace* expansionTrace = nullptr);
+    SurfaceNormalExpansionTrace* expansionTrace = nullptr,
+    const SurfaceMeshContinuityField* meshContinuity = nullptr);
 
 SurfaceNormalExpansionNeighborhood inspectSurfaceNormalExpansion(
     const SurfaceTargetCache& target,

@@ -794,7 +794,8 @@ SurfaceNormalField orientSurfaceTargetNormals(
     std::size_t seedSampleIndex,
     const openvdb::Vec3d& seedDirection,
     const SurfaceNormalOrientationSettings& settings,
-    SurfaceNormalExpansionTrace* expansionTrace)
+    SurfaceNormalExpansionTrace* expansionTrace,
+    const SurfaceMeshContinuityField* meshContinuity)
 {
     if (target.empty()) {
         return {};
@@ -807,8 +808,14 @@ SurfaceNormalField orientSurfaceTargetNormals(
         settings.minimumAlignment < 0.0 || settings.minimumAlignment > 1.0 ||
         !std::isfinite(settings.maximumSurfaceNormalComponent) ||
         settings.maximumSurfaceNormalComponent < 0.0 ||
-        settings.maximumSurfaceNormalComponent > 1.0) {
+        settings.maximumSurfaceNormalComponent > 1.0 ||
+        !std::isfinite(settings.minimumMeshContinuity) ||
+        settings.minimumMeshContinuity < 0.0 ||
+        settings.minimumMeshContinuity > 1.0) {
         throw std::invalid_argument("surface normal orientation settings are invalid");
+    }
+    if (meshContinuity && !meshContinuity->matchesSampleCount(target.samples.size())) {
+        throw std::invalid_argument("surface mesh continuity field size does not match target");
     }
 
     SurfaceNormalField result;
@@ -898,6 +905,7 @@ SurfaceNormalField orientSurfaceTargetNormals(
         double lateralDistanceSquared = 0.0;
         double forwardDot = 0.0;
         double alignment = 0.0;
+        double meshContinuity = 1.0;
     };
 
     std::vector<std::int32_t> coreOrdinalBySample(
@@ -942,9 +950,6 @@ SurfaceNormalField orientSurfaceTargetNormals(
     std::vector<std::uint8_t> orientationState(
         coreSampleIndices.size(),
         static_cast<std::uint8_t>(0));
-    std::vector<std::int32_t> orientationDepth(
-        coreSampleIndices.size(),
-        static_cast<std::int32_t>(-1));
     std::vector<std::size_t> predecessor(
         coreSampleIndices.size(),
         std::numeric_limits<std::size_t>::max());
@@ -954,9 +959,13 @@ SurfaceNormalField orientSurfaceTargetNormals(
         coreSampleIndices.size(),
         static_cast<std::uint8_t>(0));
 
-    const auto candidateIsPreferred = [](
+    const auto candidateIsPreferred = [&](
         const OrientationCandidate& candidate,
         const OrientationCandidate& current) {
+        if (meshContinuity &&
+            std::abs(candidate.meshContinuity - current.meshContinuity) > 1.0e-12) {
+            return candidate.meshContinuity > current.meshContinuity;
+        }
         if (candidate.localDistanceSquared != current.localDistanceSquared) {
             return candidate.localDistanceSquared < current.localDistanceSquared;
         }
@@ -988,7 +997,6 @@ SurfaceNormalField orientSurfaceTargetNormals(
     }
     const std::int32_t seedOrdinal = coreOrdinalBySample[seedCoreIndex];
     orientationState[static_cast<std::size_t>(seedOrdinal)] = 2;
-    orientationDepth[static_cast<std::size_t>(seedOrdinal)] = 0;
 
     std::vector<std::size_t> frontier{seedCoreIndex};
     std::vector<std::uint8_t> reevaluateFlags(
@@ -1064,6 +1072,16 @@ SurfaceNormalField orientSurfaceTargetNormals(
                         settings.maximumSurfaceNormalComponent)) {
                     continue;
                 }
+                const double meshWeight = meshContinuity
+                    ? surfaceMeshContinuityWeight(
+                        *meshContinuity,
+                        target,
+                        fromSampleIndex,
+                        candidateSampleIndex)
+                    : 1.0;
+                if (meshContinuity && meshWeight < settings.minimumMeshContinuity) {
+                    continue;
+                }
                 if (orientationState[candidateOrdinal] == 0) {
                     orientationState[candidateOrdinal] = 1;
                     buildNeighborhood(candidateOrdinal);
@@ -1089,7 +1107,8 @@ SurfaceNormalField orientSurfaceTargetNormals(
                     hasParent && forwardDot < 0.0,
                     lateralDistanceSquared,
                     forwardDot,
-                    alignment};
+                    alignment,
+                    meshWeight};
                 if (!hasPreferredCandidate[candidateOrdinal] || candidateIsPreferred(
                         candidate,
                         preferredCandidate[candidateOrdinal])) {
@@ -1138,63 +1157,40 @@ SurfaceNormalField orientSurfaceTargetNormals(
             if (candidateAxis.lengthSqr() <= kEpsilon) {
                 continue;
             }
-
-            const CachedNeighborhood& cache = neighborhoodCache[candidateOrdinal];
-            double signedVote = 0.0;
-            double voteWeight = 0.0;
-            std::size_t supportCount = 0;
-            for (std::size_t slot = 0; slot < neighborOffsetCount; ++slot) {
-                const std::int32_t neighborOrdinal = cache.neighbors[slot];
-                if (neighborOrdinal < 0) {
-                    continue;
-                }
-                const std::size_t supportOrdinal =
-                    static_cast<std::size_t>(neighborOrdinal);
-                if (orientationState[supportOrdinal] != 2 ||
-                    orientationDepth[supportOrdinal] > currentDepth) {
-                    continue;
-                }
-                const std::size_t supportSampleIndex =
-                    coreSampleIndices[supportOrdinal];
-                const openvdb::Vec3d sourceNormal = normalizeOrZero(
-                    openvdb::Vec3d(result.normals[supportSampleIndex]));
-                if (sourceNormal.lengthSqr() <= kEpsilon) {
-                    continue;
-                }
-                const double alignment = candidateAxis.dot(sourceNormal);
-                const double absoluteAlignment = std::abs(alignment);
-                if (absoluteAlignment < settings.minimumAlignment) {
-                    continue;
-                }
-                if (!surfaceContinuationAllowed(
-                        target,
-                        candidateSampleIndex,
-                        supportSampleIndex,
-                        candidateAxis,
-                        sourceNormal,
-                        settings.maximumSurfaceNormalComponent)) {
-                    continue;
-                }
-                const double distanceWeight = 1.0 /
-                    static_cast<double>(neighborOffsets[slot].distanceSquared);
-                const double weight = distanceWeight * absoluteAlignment * absoluteAlignment;
-                signedVote += weight * alignment;
-                voteWeight += weight;
-                ++supportCount;
+            if (!hasPreferredCandidate[candidateOrdinal]) {
+                continue;
             }
 
-            const bool seedRing = currentDepth == 0 && supportCount > 0;
-            if (voteWeight <= kEpsilon ||
-                (!seedRing && supportCount < 2) ||
-                std::abs(signedVote) < settings.minimumAlignment * voteWeight) {
+            // Smoothness selects the propagation edge. The sign is inherited
+            // only from the selected parent, never from a competing neighborhood
+            // vote, so a local branch cannot reverse an already oriented path.
+            const OrientationCandidate& selected =
+                preferredCandidate[candidateOrdinal];
+            const std::size_t parentOrdinal = selected.parentOrdinal;
+            if (parentOrdinal >= coreSampleIndices.size() ||
+                orientationState[parentOrdinal] != 2) {
+                continue;
+            }
+            const std::size_t parentSampleIndex = coreSampleIndices[parentOrdinal];
+            const openvdb::Vec3d parentNormal = normalizeOrZero(
+                openvdb::Vec3d(result.normals[parentSampleIndex]));
+            const double parentAlignment = candidateAxis.dot(parentNormal);
+            if (parentNormal.lengthSqr() <= kEpsilon ||
+                std::abs(parentAlignment) < settings.minimumAlignment ||
+                !surfaceContinuationAllowed(
+                    target,
+                    parentSampleIndex,
+                    candidateSampleIndex,
+                    parentNormal,
+                    candidateAxis,
+                    settings.maximumSurfaceNormalComponent)) {
                 continue;
             }
 
             result.normals[candidateSampleIndex] = openvdb::Vec3f(
-                signedVote < 0.0 ? -candidateAxis : candidateAxis);
+                parentAlignment < 0.0 ? -candidateAxis : candidateAxis);
             oriented[candidateSampleIndex] = 1;
             if (expansionTrace) {
-                const std::size_t parentOrdinal = predecessor[candidateOrdinal];
                 expansionTrace->parentBySample[candidateSampleIndex] =
                     parentOrdinal < coreSampleIndices.size()
                     ? static_cast<std::int32_t>(coreSampleIndices[parentOrdinal])
@@ -1203,77 +1199,14 @@ SurfaceNormalField orientSurfaceTargetNormals(
                 expansionTrace->orientedBySample[candidateSampleIndex] = 1;
             }
             orientationState[candidateOrdinal] = 2;
-            orientationDepth[candidateOrdinal] = nextDepth;
             nextFrontier.push_back(candidateSampleIndex);
         }
         frontier.swap(nextFrontier);
         currentDepth = nextDepth;
     }
 
-    // Reconcile loop and branch conflicts after the wavefront pass. The
-    // selected seed remains fixed while each other Core point votes against
-    // the current oriented normals of its 26-neighborhood.
-    for (std::size_t pass = 0; pass < 2; ++pass) {
-        const std::vector<openvdb::Vec3f> currentNormals = result.normals;
-        std::vector<openvdb::Vec3f> nextNormals = currentNormals;
-        for (const std::size_t sampleIndex : coreSampleIndices) {
-            if (!oriented[sampleIndex] || sampleIndex == seedCoreIndex) {
-                continue;
-            }
-            const openvdb::Vec3d axis = normalizeOrZero(
-                openvdb::Vec3d(axes.normals[sampleIndex]));
-            if (axis.lengthSqr() <= kEpsilon) {
-                continue;
-            }
-            const openvdb::Coord center = target.samples[sampleIndex].coordinate;
-            double signedVote = 0.0;
-            double voteWeight = 0.0;
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0 && dz == 0) {
-                            continue;
-                        }
-                        const auto found = coreIndices.find(center.offsetBy(dx, dy, dz));
-                        if (found == coreIndices.end() || !oriented[found->second]) {
-                            continue;
-                        }
-                        const openvdb::Vec3d neighborAxis = normalizeOrZero(
-                            openvdb::Vec3d(axes.normals[found->second]));
-                        const openvdb::Vec3d neighborNormal = normalizeOrZero(
-                            openvdb::Vec3d(currentNormals[found->second]));
-                        if (neighborAxis.lengthSqr() <= kEpsilon ||
-                            neighborNormal.lengthSqr() <= kEpsilon) {
-                            continue;
-                        }
-                        const double alignment = std::abs(axis.dot(neighborAxis));
-                        if (alignment < settings.minimumAlignment) {
-                            continue;
-                        }
-                        if (!surfaceContinuationAllowed(
-                                target,
-                                sampleIndex,
-                                found->second,
-                                axis,
-                                neighborAxis,
-                                settings.maximumSurfaceNormalComponent)) {
-                            continue;
-                        }
-                        const double weight = alignment * alignment;
-                        signedVote += weight * axis.dot(neighborNormal);
-                        voteWeight += weight;
-                    }
-                }
-            }
-            if (voteWeight <= kEpsilon ||
-                std::abs(signedVote) < settings.minimumAlignment * voteWeight) {
-                continue;
-            }
-            nextNormals[sampleIndex] = openvdb::Vec3f(
-                signedVote < 0.0 ? -axis : axis);
-        }
-        result.normals.swap(nextNormals);
-    }
+    // Do not run a post-pass neighborhood vote. Each Core sign is fixed by its
+    // selected propagation parent and must not be reversed after the wavefront.
 
     std::size_t orientedCoreCount = 0;
     for (const std::size_t sampleIndex : coreSampleIndices) {
@@ -1337,11 +1270,21 @@ SurfaceNormalField orientSurfaceTargetNormals(
                             settings.maximumSurfaceNormalComponent)) {
                         continue;
                     }
+                    const double meshWeight = meshContinuity
+                        ? surfaceMeshContinuityWeight(
+                            *meshContinuity,
+                            target,
+                            sampleIndex,
+                            found->second)
+                        : 1.0;
+                    if (meshContinuity && meshWeight < settings.minimumMeshContinuity) {
+                        continue;
+                    }
                     const double weight = 1.0 /
                         (1.0 + static_cast<double>(std::max({
                             std::abs(dx), std::abs(dy), std::abs(dz)})));
-                    sum += normal * weight;
-                    weightSum += weight;
+                    sum += normal * (weight * meshWeight * meshWeight);
+                    weightSum += weight * meshWeight * meshWeight;
                 }
             }
         }
@@ -1394,6 +1337,16 @@ SurfaceNormalField orientSurfaceTargetNormals(
                             fromNormal,
                             neighbor,
                             settings.maximumSurfaceNormalComponent)) {
+                        continue;
+                    }
+                    const double meshWeight = meshContinuity
+                        ? surfaceMeshContinuityWeight(
+                            *meshContinuity,
+                            target,
+                            fromIndex,
+                            neighborIndex)
+                        : 1.0;
+                    if (meshContinuity && meshWeight < settings.minimumMeshContinuity) {
                         continue;
                     }
                     result.normals[neighborIndex] = openvdb::Vec3f(neighbor);

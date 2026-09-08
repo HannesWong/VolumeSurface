@@ -1,6 +1,7 @@
 #include "volume_surface/SliceDiagnostics.h"
 #include "volume_surface/SurfaceBrush.h"
 #include "volume_surface/SurfaceMesh.h"
+#include "volume_surface/SurfaceMeshContinuity.h"
 #include "volume_surface/SurfaceReconstruction.h"
 #include "volume_surface/SurfaceTarget.h"
 #include "volume_surface/SurfaceTargetPreview.h"
@@ -94,6 +95,7 @@ bool rebuildSurfaceTargetCache(
     bool tryLoadExisting = true);
 bool saveSurfaceTargetCacheToDisk(ViewerState& state);
 bool loadSurfaceTargetCacheFromDisk(ViewerState& state);
+bool rebuildSurfaceMeshContinuity(ViewerState& state);
 bool loadSurfaceNormalSeedFromDisk(ViewerState& state);
 bool saveSurfaceNormalSeedToDisk(ViewerState& state);
 void processOrientationSeedPick(
@@ -1277,6 +1279,38 @@ bool saveSurfaceTargetCacheToDisk(ViewerState& state)
     return true;
 }
 
+bool rebuildSurfaceMeshContinuity(ViewerState& state)
+{
+    state.surfaceMeshContinuity = {};
+    state.surfaceMeshContinuityReady = false;
+    state.surfaceMeshContinuityBuildMilliseconds = 0.0;
+    if (!state.grid || !state.surfaceTargetCache ||
+        state.surfaceTargetCache->empty() || state.slots[0].mesh.empty()) {
+        return false;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        state.surfaceMeshContinuity = volume_surface::buildSurfaceMeshContinuity(
+            state.slots[0].mesh,
+            *state.surfaceTargetCache,
+            *state.grid);
+        state.surfaceMeshContinuityBuildMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+        state.surfaceMeshContinuityReady =
+            !state.surfaceMeshContinuity.empty() &&
+            state.surfaceMeshContinuity.supportedSampleCount > 0;
+        return state.surfaceMeshContinuityReady;
+    } catch (const std::exception&) {
+        state.surfaceMeshContinuity = {};
+        state.surfaceMeshContinuityBuildMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+        return false;
+    }
+}
+
 bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
 {
     if (!state.grid) {
@@ -1300,6 +1334,7 @@ bool loadSurfaceTargetCacheFromDisk(ViewerState& state)
             std::chrono::steady_clock::now() - start).count();
     state.surfaceTargetCache = std::make_shared<volume_surface::SurfaceTargetCache>(
         std::move(loaded));
+    rebuildSurfaceMeshContinuity(state);
     clearSurfaceFitExpansionSelection(state);
     state.normalFitReady = false;
     state.normalFitField = {};
@@ -1337,6 +1372,9 @@ bool rebuildSurfaceTargetCache(
     ViewerState& state,
     bool tryLoadExisting)
 {
+    state.surfaceMeshContinuity = {};
+    state.surfaceMeshContinuityReady = false;
+    state.surfaceMeshContinuityBuildMilliseconds = 0.0;
     if (!state.grid) {
         state.surfaceTargetStatus = "Surface target requires a loaded grid";
         return false;
@@ -1364,6 +1402,7 @@ bool rebuildSurfaceTargetCache(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
         state.surfaceTargetCache = std::move(cache);
+        rebuildSurfaceMeshContinuity(state);
         clearSurfaceFitExpansionSelection(state);
         state.normalFitReady = false;
         state.normalFitField = {};
@@ -1399,6 +1438,9 @@ bool rebuildSurfaceTargetCache(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
         state.surfaceTargetCache.reset();
+        state.surfaceMeshContinuity = {};
+        state.surfaceMeshContinuityReady = false;
+        state.surfaceMeshContinuityBuildMilliseconds = 0.0;
         clearSurfaceFitExpansionSelection(state);
         state.normalFitReady = false;
         state.normalFitField = {};
@@ -1586,7 +1628,10 @@ bool rebuildOrientedNormalField(ViewerState& state)
             seedSampleIndex,
             state.surfaceNormalSeed.normal,
             {},
-            &state.orientedNormalExpansionTrace);
+            &state.orientedNormalExpansionTrace,
+            state.surfaceMeshContinuityReady
+                ? &state.surfaceMeshContinuity
+                : nullptr);
         state.normalFitAdjacencyStatistics =
             volume_surface::analyzeSurfaceTargetNormalAdjacency(
                 *state.surfaceTargetCache,
@@ -2613,6 +2658,15 @@ void drawSurfaceTargetWindow(ViewerState& state, Engine& engine, Scene& scene)
         ImGui::Text(
             "Target extraction: %.1f ms",
             state.surfaceTargetBuildMilliseconds);
+        if (state.surfaceMeshContinuityReady) {
+            ImGui::Text(
+                "Mesh continuity: %zu / %zu samples (%.1f ms)",
+                state.surfaceMeshContinuity.supportedSampleCount,
+                state.surfaceTargetCache->samples.size(),
+                state.surfaceMeshContinuityBuildMilliseconds);
+        } else {
+            ImGui::TextUnformatted("Mesh continuity: unavailable");
+        }
     }
     if (state.brushHierarchy) {
         ImGui::Text(
@@ -3093,6 +3147,8 @@ void drawSurfaceFitWindow(ViewerState& state, Engine& engine, Scene& scene)
         state.normalFitField.smoothedTransitionCount);
     ImGui::TextWrapped(
         "This stage produces the seed field consumed by Surface Normal.");
+    ImGui::TextWrapped(
+        "Orientation propagation uses the source mesh topology continuity cache when available.");
     ImGui::TextWrapped(
         "Fitted normals use only sample positions and index connectivity; their sign is not corrected from the source normal or VDB values.");
     ImGui::TextWrapped("Status: %s", state.status.c_str());
@@ -3581,6 +3637,12 @@ int main(int argc, char** argv)
                       << " transition=" << state->surfaceTargetCache->transitionCount
                       << " build_ms=" << state->surfaceTargetBuildMilliseconds
                       << " cache_status=" << state->surfaceTargetCacheStatus << '\n';
+            std::cout << "mesh_continuity.samples="
+                      << state->surfaceMeshContinuity.supportedSampleCount
+                      << " build_ms="
+                      << state->surfaceMeshContinuityBuildMilliseconds
+                      << " ready=" << (state->surfaceMeshContinuityReady ? 1 : 0)
+                      << '\n';
         }
         printMeshInfo(*state);
         if (options.inspectOnly) {

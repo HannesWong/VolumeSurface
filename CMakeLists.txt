@@ -38,6 +38,7 @@ add_library(volume_surface_mesh
     src/SurfaceTarget.cpp
     src/SurfaceReconstruction.cpp
     src/SurfaceNormalField.cpp
+    src/SurfaceMeshContinuity.cpp
     src/VdbSurfaceProbe.cpp
 )
 
@@ -62,14 +63,18 @@ set(_surface_target_header
     "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceTarget.h")
 set(_surface_normal_field_header
     "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceNormalField.h")
+set(_surface_mesh_continuity_header
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/volume_surface/SurfaceMeshContinuity.h")
 set_source_files_properties(
     src/SurfaceTarget.cpp
     src/SurfaceReconstruction.cpp
     src/SurfaceTargetCacheRepository.cpp
     src/reconstruction_info.cpp
+    src/normal_diagnostics_info.cpp
     tests/SurfaceReconstructionTests.cpp
     tests/SurfaceTargetTests.cpp
-    PROPERTIES OBJECT_DEPENDS "${_surface_target_header};${_surface_normal_field_header}")
+    PROPERTIES OBJECT_DEPENDS
+        "${_surface_target_header};${_surface_normal_field_header};${_surface_mesh_continuity_header}")
 
 add_executable(vdb_brick_cache
     src/main.cpp
@@ -317,9 +322,9 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushPaintingPanel.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ReconstructionPanel.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/WorkflowPanel.cpp"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetCacheRepository.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/SurfaceTargetCacheRepository.cpp"
         PROPERTIES OBJECT_DEPENDS
-            "${_surface_target_header};${_surface_normal_field_header};${_viewer_state_header};${_document_session_header}")
+            "${_surface_target_header};${_surface_normal_field_header};${_surface_mesh_continuity_header};${_viewer_state_header};${_document_session_header}")
 
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/BrushCursorRenderer.cpp"
@@ -359,6 +364,18 @@ if(VOLUME_SURFACE_BUILD_TESTS)
 
     volume_surface_copy_openvdb_runtime(surface_mesh_tests)
     add_test(NAME surface_mesh_tests COMMAND surface_mesh_tests)
+
+    add_executable(surface_mesh_continuity_tests
+        tests/SurfaceMeshContinuityTests.cpp
+    )
+
+    target_link_libraries(surface_mesh_continuity_tests
+        PRIVATE
+            volume_surface_mesh
+    )
+
+    volume_surface_copy_openvdb_runtime(surface_mesh_continuity_tests)
+    add_test(NAME surface_mesh_continuity_tests COMMAND surface_mesh_continuity_tests)
 
     add_executable(surface_brush_tests
         tests/SurfaceBrushTests.cpp

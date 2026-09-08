@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "volume_surface/SurfaceBrush.h"
+#include "volume_surface/SurfaceMeshContinuity.h"
 #include "volume_surface/SurfaceReconstruction.h"
 #include "volume_surface/SurfaceTarget.h"
 
@@ -29,6 +30,10 @@ struct DocumentSession {
     std::shared_ptr<volume_surface::SurfaceTargetCache> surfaceTargetCache;
     double surfaceTargetBuildMilliseconds = 0.0;
     std::filesystem::path surfaceTargetCachePath;
+
+    volume_surface::SurfaceMeshContinuityField surfaceMeshContinuity;
+    double surfaceMeshContinuityBuildMilliseconds = 0.0;
+    bool surfaceMeshContinuityReady = false;
 
     volume_surface::SurfaceReconstructionSettings reconstructionSettings;
     volume_surface::SurfaceReconstructionTimings reconstructionTimings;

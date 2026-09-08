@@ -28,7 +28,7 @@ public:
         openvdb::Vec3d normalWorld{};
         openvdb::Vec3d referenceCenter{};
         openvdb::Vec3d voxelSize{1.0, 1.0, 1.0};
-        std::size_t neighborhoodSide = 3;
+        std::size_t neighborhoodSide = 9;
         float displayScale = 1.0f;
     };
 
