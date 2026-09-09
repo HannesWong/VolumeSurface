@@ -816,6 +816,20 @@ SurfaceReconstructionResult reconstructSurfaceMLS(
         return result;
     }
 
+    auto sourceTopologySplit = splitSurfaceMeshComponents(sourceTopology);
+    result.surfaceComponentCount = sourceTopologySplit.componentCount;
+    result.excludedTriangleCount = sourceTopologySplit.excludedTriangleCount;
+    sourceTopology = std::move(sourceTopologySplit.primary);
+    if (sourceTopology.empty()) {
+        result.timings.meshExtractionMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - topologyStart).count();
+        result.timings.totalMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - totalStart).count();
+        return result;
+    }
+
     result.projectionVertexCount = sourceTopology.vertices.size();
     result.candidateCellCount = result.projectionVertexCount;
     result.fieldSampleCount = result.projectionVertexCount;

@@ -37,6 +37,8 @@ struct SurfaceTargetSettings
     double normalRadius = 0.002;
     double planarityRadius = 0.002;
     double planarityAngularScaleRadians = 0.2617993877991494;
+    // Retained in the cache schema for compatibility; extraction no longer
+    // rejects large inputs based on a fixed sample-count limit.
     std::size_t maximumSampleCount = 8'000'000;
 };
 

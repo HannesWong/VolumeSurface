@@ -368,6 +368,10 @@ int main(int argc, char** argv)
                   << (result.usedSourceTopologyFallback ? 1 : 0) << '\n'
                   << "reconstruction.source_topology_projection_fallback="
                   << result.sourceTopologyProjectionFallbackCount << '\n'
+                  << "reconstruction.surface_components="
+                  << result.surfaceComponentCount << '\n'
+                  << "reconstruction.excluded_triangles="
+                  << result.excludedTriangleCount << '\n'
                   << "reconstruction.topology=source\n"
                   << "reconstruction.projection_vertices="
                   << result.projectionVertexCount << '\n'

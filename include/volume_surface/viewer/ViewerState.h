@@ -160,6 +160,12 @@ struct ViewerState : DocumentSession, BrushInteractionState {
     std::size_t surfaceTargetExcludedCoreCount = 0;
     std::size_t surfaceTargetExcludedTransitionCount = 0;
     std::string reconstructionStatus = "Result A has not been generated";
+    std::filesystem::path exportDirectory;
+    std::array<char, 256> exportFileName{"reconstructed"};
+    bool exportNormals = false;
+    std::string exportStatus = "No reconstructed mesh has been exported";
+    std::filesystem::path exportPendingPath;
+    bool exportOverwritePending = false;
     bool reconstructionPickArmed = false;
     bool reconstructionPickRequested = false;
     int reconstructionPickX = 0;

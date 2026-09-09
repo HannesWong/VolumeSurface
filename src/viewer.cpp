@@ -1,4 +1,5 @@
 #include "volume_surface/SliceDiagnostics.h"
+#include "volume_surface/GltfExport.h"
 #include "volume_surface/SurfaceBrush.h"
 #include "volume_surface/SurfaceMesh.h"
 #include "volume_surface/SurfaceReconstruction.h"
@@ -19,6 +20,7 @@
 #include "volume_surface/viewer/ViewerOptions.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -26,9 +28,12 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <exception>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -49,6 +54,11 @@
 #include <math/vec4.h>
 #include <openvdb/io/File.h>
 #include <openvdb/Metadata.h>
+
+#ifdef _WIN32
+#include <shlobj.h>
+#include <windows.h>
+#endif
 
 using filament::Engine;
 using filament::Scene;
@@ -84,9 +94,11 @@ using SurfaceTargetPointPicker =
     volume_surface::viewer::SurfaceTargetPointPicker;
 using SurfaceNormalSeed = volume_surface::viewer::SurfaceNormalSeed;
 using SurfaceNormalSeedStore = volume_surface::viewer::SurfaceNormalSeedStore;
+using volume_surface::writeSurfaceMeshGlb;
 using ReconstructionPanelAction =
     volume_surface::viewer::ReconstructionPanelAction;
 using volume_surface::viewer::parseViewerOptions;
+using volume_surface::viewer::selectVdbInputFromCatalog;
 
 namespace {
 
@@ -95,12 +107,108 @@ using BrushProfileStroke = volume_surface::viewer::BrushProfileStroke;
 constexpr float kCameraNearMeters = 0.0001f;
 constexpr float kCameraFarMeters = 10.0f;
 
+std::string escapeViewerLogJson(std::string_view value) noexcept
+{
+    std::string escaped;
+    try {
+        escaped.reserve(value.size() + 8);
+        for (const char character : value) {
+            switch (character) {
+                case '\\': escaped += "\\\\"; break;
+                case '"': escaped += "\\\""; break;
+                case '\n': escaped += "\\n"; break;
+                case '\r': escaped += "\\r"; break;
+                case '\t': escaped += "\\t"; break;
+                default: escaped += character; break;
+            }
+        }
+    } catch (...) {
+        escaped.clear();
+    }
+    return escaped;
+}
+
+std::filesystem::path viewerErrorLogPath() noexcept
+{
+    try {
+        const std::filesystem::path catalog =
+            volume_surface::viewer::viewerInputCatalogPath();
+        if (!catalog.parent_path().empty()) {
+            return catalog.parent_path() / "viewer_error.jsonl";
+        }
+        return std::filesystem::current_path() / "viewer_error.jsonl";
+    } catch (...) {
+        return "viewer_error.jsonl";
+    }
+}
+
+void appendViewerLog(
+    const char* level,
+    const char* stage,
+    std::string_view message,
+    const std::filesystem::path& input = {}) noexcept
+{
+    try {
+        std::ofstream output(viewerErrorLogPath(), std::ios::app);
+        if (!output) {
+            return;
+        }
+        const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        output << "{\"time_unix_ms\":" << timestamp
+               << ",\"level\":\"" << escapeViewerLogJson(level)
+               << "\",\"stage\":\"" << escapeViewerLogJson(stage)
+               << "\",\"message\":\"" << escapeViewerLogJson(message)
+               << "\"";
+        if (!input.empty()) {
+            output << ",\"input\":\""
+                   << escapeViewerLogJson(input.generic_string()) << "\"";
+        }
+        output << "}\n";
+    } catch (...) {
+    }
+}
+
+void viewerTerminateHandler() noexcept
+{
+    appendViewerLog(
+        "fatal",
+        "terminate",
+        "std::terminate was invoked");
+    std::_Exit(EXIT_FAILURE);
+}
+
+#ifdef _WIN32
+LONG WINAPI viewerUnhandledExceptionFilter(
+    EXCEPTION_POINTERS* exceptionInfo) noexcept
+{
+    try {
+        std::ostringstream message;
+        if (exceptionInfo && exceptionInfo->ExceptionRecord) {
+            message << "SEH exception code=0x" << std::hex
+                    << exceptionInfo->ExceptionRecord->ExceptionCode
+                    << " address=0x" << reinterpret_cast<std::uintptr_t>(
+                        exceptionInfo->ExceptionRecord->ExceptionAddress);
+        } else {
+            message << "SEH exception without exception record";
+        }
+        appendViewerLog(
+            "fatal",
+            "unhandled_exception",
+            message.str());
+    } catch (...) {
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
 bool surfaceTargetCoordinateLess(
     const openvdb::Coord& left,
     const openvdb::Coord& right);
 
 void applyWorkflowPresentation(ViewerState& state, Scene& scene);
 void setWorkflowStage(ViewerState& state, Scene& scene, WorkflowStage stage);
+void rebuildExcludedMask(ViewerState& state);
 bool rebuildSurfaceTargetCache(
     ViewerState& state,
     bool tryLoadExisting = true);
@@ -2294,6 +2402,7 @@ void rebuildReference(ViewerState& state, Engine& engine, Scene& scene)
         destroyExcludedSourceMesh(state, engine, scene);
         reference.mesh = std::move(meshSplit.primary);
         state.excludedSourceSlot.mesh = std::move(meshSplit.excluded);
+        rebuildExcludedMask(state);
         reference.visible = true;
         for (std::size_t index = 1; index < state.slots.size(); ++index) {
             auto& resultSlot = state.slots[index];
@@ -4059,6 +4168,118 @@ void drawNormalFieldWindow(ViewerState& state, Engine& engine, Scene& scene)
     ImGui::End();
 }
 
+std::filesystem::path chooseExportDirectory(
+    const std::filesystem::path& currentDirectory)
+{
+#ifdef _WIN32
+    const std::wstring initialPath = currentDirectory.wstring();
+    auto browseCallback = [](HWND window, UINT message, LPARAM, LPARAM data) -> int {
+        if (message == BFFM_INITIALIZED && data != 0) {
+            const auto* path = reinterpret_cast<const std::wstring*>(data);
+            if (path != nullptr && !path->empty()) {
+                SendMessageW(
+                    window,
+                    BFFM_SETSELECTIONW,
+                    TRUE,
+                    reinterpret_cast<LPARAM>(path->c_str()));
+            }
+        }
+        return 0;
+    };
+    BROWSEINFOW browseInfo{};
+    browseInfo.hwndOwner = GetForegroundWindow();
+    browseInfo.lpszTitle = L"Select the GLB export folder";
+    browseInfo.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    browseInfo.lpfn = browseCallback;
+    browseInfo.lParam = reinterpret_cast<LPARAM>(&initialPath);
+    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browseInfo);
+    if (item == nullptr) {
+        return {};
+    }
+    wchar_t pathBuffer[MAX_PATH]{};
+    const bool pathReady = SHGetPathFromIDListW(item, pathBuffer) != FALSE;
+    CoTaskMemFree(item);
+    return pathReady ? std::filesystem::path(pathBuffer)
+                     : std::filesystem::path{};
+#else
+    (void)currentDirectory;
+    return {};
+#endif
+}
+
+std::filesystem::path exportPathForState(const ViewerState& state)
+{
+    if (state.exportDirectory.empty()) {
+        return {};
+    }
+    std::filesystem::path name(state.exportFileName.data());
+    name = name.filename();
+    if (name.empty() || name == "." || name == "..") {
+        return {};
+    }
+    std::string extension = name.extension().string();
+    std::transform(
+        extension.begin(),
+        extension.end(),
+        extension.begin(),
+        [](const unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+    if (extension != ".glb") {
+        name += ".glb";
+    }
+    return state.exportDirectory / name;
+}
+
+void exportResultA(ViewerState& state, const std::filesystem::path& path)
+{
+    if (!state.slots[1].available()) {
+        state.exportStatus = "Result A is not available";
+        return;
+    }
+    state.exportStatus = "Exporting reconstructed mesh...";
+    const auto result = writeSurfaceMeshGlb(
+        state.slots[1].mesh,
+        path,
+        state.exportNormals);
+    if (!result.success) {
+        state.exportStatus = "Export failed: " + result.error;
+        return;
+    }
+    state.exportStatus =
+        "Exported " + std::to_string(state.slots[1].mesh.vertices.size()) +
+        " vertices / " + std::to_string(state.slots[1].mesh.triangleCount()) +
+        (state.exportNormals
+            ? " triangles with normals ("
+            : " triangles without normals (") +
+        std::to_string(result.bytesWritten / (1024 * 1024)) +
+        " MiB)";
+    state.status = "Reconstructed mesh exported to " + path.string();
+}
+
+void rebuildExcludedMask(ViewerState& state)
+{
+    state.excludedMaskGrid.reset();
+    state.excludedMaskVoxelCount = 0;
+    if (!state.grid || state.excludedSourceSlot.mesh.empty()) {
+        state.excludedMaskStatus = "No excluded surface component is present";
+        return;
+    }
+    try {
+        state.excludedMaskGrid = volume_surface::buildSurfaceMeshMask(
+            state.excludedSourceSlot.mesh,
+            state.grid->transform(),
+            3.0f);
+        state.excludedMaskVoxelCount = state.excludedMaskGrid->activeVoxelCount();
+        state.excludedMaskStatus =
+            "Excluded mask ready: " +
+            std::to_string(state.excludedMaskVoxelCount) + " active voxels";
+    } catch (const std::exception& error) {
+        state.excludedMaskStatus =
+            std::string("Excluded mask failed: ") + error.what();
+    }
+}
+
 void drawReviewWindow(ViewerState& state, Engine& engine, Scene& scene)
 {
     ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Once);
@@ -4067,9 +4288,81 @@ void drawReviewWindow(ViewerState& state, Engine& engine, Scene& scene)
     ImGui::Begin("Review / Export");
     state.mouseOverUi |= ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
     ImGui::TextWrapped(
-        "Compare the reference and generated result slots here. Export controls will be added with the reconstruction backend.");
+        "Review the generated reconstruction and export only Result A as a material-free GLB.");
     for (std::size_t index = 0; index < state.slots.size(); ++index) {
         drawSlotControls(state, engine, scene, index);
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted("Reconstructed mesh export");
+    ImGui::TextWrapped(
+        "The exported file contains the reconstructed vertex positions, vertex normals, and triangle indices. Viewer display transforms are not exported.");
+    if (state.exportDirectory.empty()) {
+        state.exportDirectory = state.input.parent_path();
+    }
+    const std::string exportFolderText = state.exportDirectory.empty()
+        ? "not selected"
+        : state.exportDirectory.string();
+    ImGui::TextWrapped("Folder: %s", exportFolderText.c_str());
+    if (ImGui::Button("Choose export folder")) {
+        const auto selected = chooseExportDirectory(state.exportDirectory);
+        if (!selected.empty()) {
+            state.exportDirectory = selected;
+            state.exportStatus = "Export folder selected";
+        }
+    }
+    ImGui::InputText(
+        "File name",
+        state.exportFileName.data(),
+        state.exportFileName.size());
+    ImGui::Checkbox("Include vertex normals", &state.exportNormals);
+    const auto outputPath = exportPathForState(state);
+    if (!outputPath.empty()) {
+        const std::string outputPathText = outputPath.string();
+        ImGui::TextWrapped("Output: %s", outputPathText.c_str());
+    } else {
+        ImGui::TextUnformatted("Output: enter a file name and select a folder");
+    }
+    const bool canExport = state.slots[1].available() && !outputPath.empty();
+    ImGui::BeginDisabled(!canExport);
+    const bool exportClicked = ImGui::Button("Export reconstructed mesh");
+    ImGui::EndDisabled();
+    if (exportClicked) {
+        std::error_code outputPathError;
+        const bool outputExists = std::filesystem::exists(outputPath, outputPathError);
+        if (outputPathError) {
+            state.exportStatus =
+                "Export path check failed: " + outputPathError.message();
+        } else if (outputExists) {
+            state.exportPendingPath = outputPath;
+            state.exportOverwritePending = true;
+        } else {
+            exportResultA(state, outputPath);
+        }
+    }
+    ImGui::TextWrapped("Status: %s", state.exportStatus.c_str());
+    if (state.exportOverwritePending) {
+        ImGui::OpenPopup("Confirm GLB overwrite");
+        state.exportOverwritePending = false;
+    }
+    if (ImGui::BeginPopupModal(
+            "Confirm GLB overwrite",
+            nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "The file already exists. Overwrite it?\n%s",
+            state.exportPendingPath.string().c_str());
+        if (ImGui::Button("Overwrite")) {
+            exportResultA(state, state.exportPendingPath);
+            state.exportPendingPath.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            state.exportPendingPath.clear();
+            state.exportStatus = "Export cancelled";
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
     ImGui::End();
 }
@@ -4349,7 +4642,9 @@ void printMeshInfo(const ViewerState& state)
               << "vertices=" << mesh.vertices.size() << '\n'
               << "triangles=" << mesh.triangleCount() << '\n'
               << "excluded_vertices=" << state.excludedSourceSlot.mesh.vertices.size() << '\n'
-              << "excluded_triangles=" << state.excludedSourceSlot.mesh.triangleCount() << '\n';
+              << "excluded_triangles=" << state.excludedSourceSlot.mesh.triangleCount() << '\n'
+              << "excluded_mask_voxels=" << state.excludedMaskVoxelCount << '\n'
+              << "excluded_mask_status=" << state.excludedMaskStatus << '\n';
 }
 
 void printSliceInfo(const ViewerState& state)
@@ -4384,26 +4679,78 @@ void printSliceInfo(const ViewerState& state)
 
 int main(int argc, char** argv)
 {
+    std::set_terminate(viewerTerminateHandler);
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(viewerUnhandledExceptionFilter);
+#endif
+    std::filesystem::path activeInput;
     try {
+        appendViewerLog("info", "launch", "viewer process started");
         const ViewerOptions options = parseViewerOptions(argc, argv);
+        appendViewerLog(
+            "info",
+            "options_parsed",
+            options.input.empty() ? "no explicit input path" : "explicit input path",
+            options.input);
         openvdb::initialize();
+        appendViewerLog("info", "openvdb_initialized", "OpenVDB initialized");
+
+        ViewerOptions resolvedOptions = options;
+        if (resolvedOptions.input.empty()) {
+            if (resolvedOptions.inspectOnly ||
+                resolvedOptions.headlessSmoke ||
+                !resolvedOptions.replayBrushProfile.empty()) {
+                resolvedOptions.input =
+                    R"(G:\transformed\rightArm\rightArm.0224.vdb)";
+                appendViewerLog(
+                    "info",
+                    "input_resolved",
+                    "non-interactive mode selected the rightArm fallback",
+                    resolvedOptions.input);
+            } else {
+                appendViewerLog(
+                    "info",
+                    "input_selection",
+                    "waiting for startup input selector");
+                resolvedOptions.input = selectVdbInputFromCatalog();
+                if (resolvedOptions.input.empty()) {
+                    throw std::runtime_error("No input VDB file was selected");
+                }
+                appendViewerLog(
+                    "info",
+                    "input_selected",
+                    "startup selector returned an input",
+                    resolvedOptions.input);
+            }
+        }
+        activeInput = resolvedOptions.input;
 
         auto state = std::make_shared<ViewerState>();
-        state->input = options.input;
-        state->gridName = options.gridName;
-        state->isoValue = static_cast<float>(options.isoValue);
-        state->referenceIsoValue = static_cast<float>(options.isoValue);
-        state->adaptivity = static_cast<float>(options.adaptivity);
-        state->headlessSmoke = options.headlessSmoke;
-        state->replayBrushProfile = !options.replayBrushProfile.empty();
+        state->input = resolvedOptions.input;
+        state->gridName = resolvedOptions.gridName;
+        state->isoValue = static_cast<float>(resolvedOptions.isoValue);
+        state->referenceIsoValue = static_cast<float>(resolvedOptions.isoValue);
+        state->adaptivity = static_cast<float>(resolvedOptions.adaptivity);
+        state->headlessSmoke = resolvedOptions.headlessSmoke;
+        state->replayBrushProfile = !resolvedOptions.replayBrushProfile.empty();
         if (state->replayBrushProfile) {
             state->brushProfileReplayStrokes =
-                loadBrushProfileDocument(options.replayBrushProfile);
+                loadBrushProfileDocument(resolvedOptions.replayBrushProfile);
         }
         state->brushPaintingPanel.loadSettings(*state);
-        state->grid = loadFloatGrid(options.input, options.gridName);
+        appendViewerLog(
+            "info",
+            "grid_load_started",
+            "loading selected grid",
+            activeInput);
+        state->grid = loadFloatGrid(resolvedOptions.input, resolvedOptions.gridName);
+        appendViewerLog(
+            "info",
+            "grid_loaded",
+            "selected grid loaded",
+            activeInput);
         state->brushWeightGrid = state->brushPaintingPanel.createWeightGrid(*state->grid);
-        state->brushWeightFieldDirectory = brushWeightFieldDirectoryForInput(options.input);
+        state->brushWeightFieldDirectory = brushWeightFieldDirectoryForInput(resolvedOptions.input);
         state->brushPaintingPanel.refreshWeightFieldLibrary(*state);
         state->sliceBounds = state->grid->evalActiveVoxelBoundingBox();
         state->sliceBounds.expand(1);
@@ -4413,21 +4760,42 @@ int main(int argc, char** argv)
         }
         const auto rawSourceMesh = volume_surface::extractIsoSurface(
             *state->grid,
-            options.isoValue,
-            options.adaptivity);
+            resolvedOptions.isoValue,
+            resolvedOptions.adaptivity);
+        appendViewerLog(
+            "info",
+            "source_mesh_extracted",
+            "initial iso surface extracted",
+            activeInput);
         auto sourceMeshSplit = volume_surface::splitSurfaceMeshComponents(
             rawSourceMesh);
         state->slots[0].mesh = std::move(sourceMeshSplit.primary);
         state->excludedSourceSlot.mesh = std::move(sourceMeshSplit.excluded);
+        rebuildExcludedMask(*state);
         if (state->slots[0].mesh.empty()) {
             throw std::runtime_error("No surface found at the selected density value");
         }
         updateReferenceTransform(*state);
-        if (!options.inspectOnly) {
+        if (!resolvedOptions.inspectOnly) {
+            appendViewerLog(
+                "info",
+                "surface_target_started",
+                "building or loading Surface Target",
+                activeInput);
             rebuildSurfaceTargetCache(*state);
             if (!state->surfaceTargetCache) {
+                appendViewerLog(
+                    "error",
+                    "surface_target_failed",
+                    state->surfaceTargetStatus,
+                    activeInput);
                 throw std::runtime_error(state->surfaceTargetStatus);
             }
+            appendViewerLog(
+                "info",
+                "surface_target_ready",
+                "Surface Target is ready",
+                activeInput);
             std::cout << "surface_target.samples="
                       << state->surfaceTargetCache->samples.size()
                       << " core=" << state->surfaceTargetCache->coreCount
@@ -4444,7 +4812,7 @@ int main(int argc, char** argv)
                       << state->localNormalSeedCacheStatus << '\n';
         }
         printMeshInfo(*state);
-        if (options.inspectOnly) {
+        if (resolvedOptions.inspectOnly) {
             printSliceInfo(*state);
             return EXIT_SUCCESS;
         }
@@ -4462,10 +4830,17 @@ int main(int argc, char** argv)
             Engine::Backend::OPENGL,
             &state->wheelZoomMultiplier,
             state.get());
+        appendViewerLog(
+            "info",
+            "viewer_starting",
+            "creating Filament viewer",
+            activeInput);
         auto viewer = createViewer(state, displayManager.get());
         viewer->run();
+        appendViewerLog("info", "viewer_closed", "viewer exited normally", activeInput);
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
+        appendViewerLog("error", "main_exception", error.what(), activeInput);
         std::cerr << "error: " << error.what() << '\n';
         return EXIT_FAILURE;
     }

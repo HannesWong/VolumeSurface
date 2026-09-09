@@ -310,8 +310,7 @@ SurfaceTargetCache extractSurfaceTarget(
         !std::isfinite(settings.normalRadius) || settings.normalRadius <= 0.0 ||
         !std::isfinite(settings.planarityRadius) || settings.planarityRadius <= 0.0 ||
         !std::isfinite(settings.planarityAngularScaleRadians) ||
-            settings.planarityAngularScaleRadians <= 0.0 ||
-        settings.maximumSampleCount == 0) {
+            settings.planarityAngularScaleRadians <= 0.0) {
         throw std::invalid_argument("surface target settings are invalid");
     }
 
@@ -426,10 +425,6 @@ SurfaceTargetCache extractSurfaceTarget(
     allCoordinates.erase(
         std::unique(allCoordinates.begin(), allCoordinates.end()),
         allCoordinates.end());
-    if (allCoordinates.size() > settings.maximumSampleCount) {
-        throw std::length_error("surface target sample count exceeds configured limit");
-    }
-
     const auto accessor = grid.getConstAccessor();
     SurfaceTargetCache cache;
     cache.samples.reserve(allCoordinates.size());
@@ -789,8 +784,7 @@ bool loadSurfaceTargetCache(
     if (!metadataMatches(expectedMetadata, actualMetadata)) {
         return setCacheError(error, "surface target cache metadata does not match the current source");
     }
-    if (sampleCount > expectedMetadata.settings.maximumSampleCount ||
-        sampleCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+    if (sampleCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
         coreCount > sampleCount ||
         transitionCount > sampleCount ||
         coreCount + transitionCount != sampleCount) {

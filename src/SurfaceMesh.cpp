@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <openvdb/tools/Interpolation.h>
+#include <openvdb/tools/MeshToVolume.h>
 #include <openvdb/tools/VolumeToMesh.h>
 
 namespace volume_surface {
@@ -423,6 +424,49 @@ SurfaceMeshComponentSplit splitSurfaceMeshComponents(const SurfaceMesh& mesh)
     }
     result.excluded = compactTriangleSubset(mesh, excludedTriangles);
     return result;
+}
+
+openvdb::BoolGrid::Ptr buildSurfaceMeshMask(
+    const SurfaceMesh& mesh,
+    const openvdb::math::Transform& transform,
+    float halfWidthVoxels)
+{
+    auto mask = openvdb::BoolGrid::create(false);
+    mask->setName("excluded_surface_mask");
+    mask->setTransform(transform.copy());
+    if (mesh.empty()) {
+        return mask;
+    }
+    if (!std::isfinite(halfWidthVoxels) || halfWidthVoxels <= 0.0f) {
+        throw std::invalid_argument("Surface mesh mask half width must be positive");
+    }
+
+    std::vector<openvdb::Vec3s> points;
+    points.reserve(mesh.vertices.size());
+    for (const auto& vertex : mesh.vertices) {
+        points.emplace_back(
+            vertex.position[0],
+            vertex.position[1],
+            vertex.position[2]);
+    }
+    std::vector<openvdb::Vec3I> triangles;
+    triangles.reserve(mesh.triangleCount());
+    for (std::size_t index = 0; index < mesh.indices.size(); index += 3) {
+        triangles.emplace_back(
+            static_cast<int>(mesh.indices[index]),
+            static_cast<int>(mesh.indices[index + 1]),
+            static_cast<int>(mesh.indices[index + 2]));
+    }
+
+    const auto levelSet = openvdb::tools::meshToLevelSet<openvdb::FloatGrid>(
+        transform,
+        points,
+        triangles,
+        halfWidthVoxels);
+    for (auto iterator = levelSet->cbeginValueOn(); iterator; ++iterator) {
+        mask->tree().setValueOn(iterator.getCoord());
+    }
+    return mask;
 }
 
 } // namespace volume_surface

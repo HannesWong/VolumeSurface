@@ -29,6 +29,9 @@ struct DocumentSession {
     std::shared_ptr<volume_surface::SurfaceTargetCache> surfaceTargetCache;
     double surfaceTargetBuildMilliseconds = 0.0;
     std::filesystem::path surfaceTargetCachePath;
+    openvdb::BoolGrid::Ptr excludedMaskGrid;
+    std::size_t excludedMaskVoxelCount = 0;
+    std::string excludedMaskStatus = "Excluded surface mask has not been built";
 
     volume_surface::SurfaceReconstructionSettings reconstructionSettings;
     volume_surface::SurfaceReconstructionTimings reconstructionTimings;

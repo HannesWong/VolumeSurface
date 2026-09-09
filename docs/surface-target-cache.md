@@ -24,6 +24,8 @@ Surface Target 使用与输入 VDB 同目录的 sidecar 文件保存，不压缩
 
 `normalRadius` 字段暂时保留在元数据中以兼容已有接口，但不再参与法线计算。版本号变化会使旧 sidecar 自动失效，避免旧的平滑法线混入新的连通趋势流程。
 
+`maximumSampleCount` 同样保留在缓存头中以兼容既有 sidecar，但当前提取流程不再用固定的 8,000,000 样本数拒绝大数据。大体量输入仍可能受到可用内存和后续 GPU 缓冲容量影响。
+
 ## 局部 flip point 自动缓存
 
 局部 flip point 在 Local Flip Points 面板中执行 Add 后立即写入 JSONL、启用并重放；`Replay selected flip point` 可再次执行同一点的回放；删除 flip point 后也立即重写该小文件。应用加载几何缓存后会自动读取有效的局部 flip point，按保存顺序在全局 seed 基线之上重放，并重新计算 affected/boundary 区域。affected/boundary 点集不落盘，避免平滑参数或拒止边界策略变化后继续使用过期结果。旧文件中的 `seed` 记录仍可读取，但会作为 legacy inactive 保留，不会自动参与翻转；新保存的记录使用 `flip_point`。

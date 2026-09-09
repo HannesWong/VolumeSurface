@@ -32,6 +32,7 @@ target_compile_definitions(volume_surface_bricks
 )
 
 add_library(volume_surface_mesh
+    src/GltfExport.cpp
     src/SurfaceMesh.cpp
     src/SurfaceBrush.cpp
     src/SliceDiagnostics.cpp
@@ -41,6 +42,12 @@ add_library(volume_surface_mesh
     src/SurfaceNormalField.cpp
     src/VdbSurfaceProbe.cpp
 )
+
+if(MSVC)
+    set_source_files_properties(
+        src/SurfaceMesh.cpp
+        PROPERTIES COMPILE_OPTIONS "/bigobj")
+endif()
 
 target_include_directories(volume_surface_mesh
     PUBLIC
@@ -311,6 +318,9 @@ if(VOLUME_SURFACE_BUILD_VIEWER)
         PRIVATE
             NOMINMAX
     )
+    if(WIN32)
+        target_link_libraries(volume_surface_viewer PRIVATE shell32 ole32)
+    endif()
 
     set(_viewer_cjk_font "")
     if(WIN32 AND EXISTS "C:/Windows/Fonts/simhei.ttf")
@@ -434,4 +444,16 @@ if(VOLUME_SURFACE_BUILD_TESTS)
 
     volume_surface_copy_openvdb_runtime(surface_target_tests)
     add_test(NAME surface_target_tests COMMAND surface_target_tests)
+
+    add_executable(gltf_export_tests
+        tests/GltfExportTests.cpp
+    )
+
+    target_link_libraries(gltf_export_tests
+        PRIVATE
+            volume_surface_mesh
+    )
+
+    volume_surface_copy_openvdb_runtime(gltf_export_tests)
+    add_test(NAME gltf_export_tests COMMAND gltf_export_tests)
 endif()

@@ -43,4 +43,10 @@ SurfaceMesh extractIsoSurface(
 
 SurfaceMeshComponentSplit splitSurfaceMeshComponents(const SurfaceMesh& mesh);
 
+// Builds a sparse narrow-band mask around a surface mesh using the supplied VDB transform.
+openvdb::BoolGrid::Ptr buildSurfaceMeshMask(
+    const SurfaceMesh& mesh,
+    const openvdb::math::Transform& transform,
+    float halfWidthVoxels = 3.0f);
+
 } // namespace volume_surface
